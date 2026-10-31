@@ -50,9 +50,6 @@ Dokumentacja operacyjna i przewodnik użytkownika dla systemu CAD/CAM **LaserBur
 
 Interfejs LaserBurn Studio został zoptymalizowany pod kątem szybkiej obsługi warsztatowej i podzielony na cztery główne obszary:
 
-![Układ paneli i pasków narzędzi](docs/uklad_interfejsu.png)
-> **Rysunek 2:** *Układ ekranu: Pasek Maszyny (góra-lewo), Pasek Edycji (drugi wiersz), Stół CAD (centrum) i Panel Warstw/Jog/Plaster (prawo).*
-
 1. **Pasek Projektu i Maszyny (Górny rząd):**
    * Pliki projektu: `📄 Nowy projekt`, `📂 Otwórz projekt...`, `💾 Zapisz projekt`.
    * Przycisk importu wektorów `📂` (`Ctrl+I`).
@@ -89,17 +86,12 @@ Interfejs LaserBurn Studio został zoptymalizowany pod kątem szybkiej obsługi 
   * Kliknij bezpośrednio na kontur lub wypełnienie wybranego elementu.
   * Wciśnij LPM na wolnym tle stołu i przeciągnij, aby objąć obiekty prostokątną ramką zaznaczenia (*Rubber-Band Selection*).
 
-![Zaznaczanie ramką](docs/zaznaczanie_ramka.png)
-> **Rysunek 3:** *Przeciąganie ramki zaznaczenia obejmującej kilka wektorów jednocześnie.*
-
 ---
 
 ## 4. Zarządzanie Obiektami i Schowek
 
 Po zaznaczeniu jednego lub wielu elementów na stole uaktywnia się manipulator przekształceń `TransformBoxItem`:
 
-![Manipulator CAD](docs/manipulator_cad.png)
-> **Rysunek 4:** *Manipulator transformacji: uchwyty skalowania narożnikowego, obrys bounding-box oraz zielony uchwyt obrotu.*
 
 ### Operacje geometryczne
 * **Przesuwanie:** Chwyć element wewnątrz ramki i przeciągnij go. Moduł `SnapEngine` automatycznie przyciągnie krawędzie do siatki stołu lub sąsiednich obiektów (zasygnalizowane błękitnymi liniami prowadzącymi).
@@ -123,7 +115,7 @@ Po zaznaczeniu jednego lub wielu elementów na stole uaktywnia się manipulator 
 LaserBurn Studio przypisuje parametry obróbki do geometrii na podstawie koloru jej obrysu.
 
 ![Tabela warstw technologicznych](docs/tabela_warstw.png)
-> **Rysunek 5:** *Tabela warstw technologicznych oraz paleta szybkiego przypisywania C00–C07.*
+> **Rysunek 2:** *Tabela warstw technologicznych oraz paleta szybkiego przypisywania C00–C07.*
 
 ### Dostępne tryby pracy warstwy
 1. **Line (Cięcie / Obrys):**
@@ -156,7 +148,7 @@ LaserBurn Studio przypisuje parametry obróbki do geometrii na podstawie koloru 
 * Obraz zostanie wstawiony w punkcie $(50, 50)$ mm lub automatycznie w środku geometrycznym (centroidzie) zarejestrowanego plastra.
 
 ![Import geometrii i rastrów](docs/import_wektor_raster.png)
-> **Rysunek 6:** *Zaimportowany wektor SVG oraz przetworzona grafika rastrowa na stole roboczym.*
+> **Rysunek 3:** *Zaimportowany wektor SVG oraz przetworzona grafika rastrowa na stole roboczym.*
 
 ---
 
@@ -165,7 +157,7 @@ LaserBurn Studio przypisuje parametry obróbki do geometrii na podstawie koloru 
 Funkcja umożliwiająca bezpieczne i estetyczne grawerowanie na plastrach pnia o nieregularnym, naturalnym obwodzie:
 
 ![Procedura mapowania plastra](docs/plaster_mapowanie.png)
-> **Rysunek 7:** *Wyznaczone punkty brzegowe plastra drewna oraz wyliczona otoczka Convex Hull z centroidem.*
+> **Rysunek 4:** *Wyznaczone punkty brzegowe plastra drewna oraz wyliczona otoczka Convex Hull z centroidem.*
 
 ### Procedura postępowania:
 1. Umieść plaster drewna na stole roboczym urządzenia.
@@ -198,7 +190,7 @@ Przed załączeniem pełnej mocy lasera wykonaj weryfikację geometrii i czasów
   * Wyświetlony zostanie dokładny estymowany czas wykonania zadania liczony modelem trapezoidalnym dynamiki osi.
 
 ![Wizualizer i symulator G-code](docs/symulator_gcode.png)
-> **Rysunek 8:** *Weryfikacja trajektorii w oknie symulacji G-code z kalkulacją czasu cyklu.*
+> **Rysunek 5:** *Weryfikacja trajektorii w oknie symulacji G-code z kalkulacją czasu cyklu.*
 
 ---
 
@@ -208,7 +200,7 @@ Przed załączeniem pełnej mocy lasera wykonaj weryfikację geometrii i czasów
 Wpisz adres mostka WebSocket (np. `ws://malina.local:8000/ws`) i kliknij `⚡` (lub skrót **F2**).
 
 ![Połączenie sieciowe z maszyną](docs/polaczenie.png)
-> **Rysunek 9:** *Pasek maszyny po nawiązaniu komunikacji z mostkiem GRBL.*
+> **Rysunek 6:** *Pasek maszyny po nawiązaniu komunikacji z mostkiem GRBL.*
 
 ### Rozpoczęcie wypalania
 * Kliknij zielony przycisk `▶` na pasku maszyny lub wciśnij klawisz **F5**.
