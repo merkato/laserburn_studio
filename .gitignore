@@ -1,0 +1,27 @@
+# Środowisko wirtualne
+.venv/
+venv/
+ENV/
+env/
+
+# Bytecode Pythona i cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Pliki tymczasowe edytorów i IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Pliki projektowe i eksporty lokalne
+*.nc
+*.gcode
+*.bak*
+temp/
+dist/
+build/
+*.spec
