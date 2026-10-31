@@ -76,9 +76,8 @@ B. G.
 
 ---
 
-### 💖 Dedykacja
+### 💖 Z dedykacją dla S.J.
 
-> **Z dedykacją dla S.J.**  
 > *Będę przeganiał diabła w nas*  
 > *Wciąż i wciąż*  
 > *Będę za rękę chwytać czas*  
