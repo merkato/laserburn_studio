@@ -79,4 +79,13 @@ B. G.
 ### 💖 Dedykacja
 
 > **Z dedykacją dla S.J.**  
-> *Dajesz mi siłę i wiarę w jutro. W lepsze jutro*
+>```text
+Będę przeganiał diabła w nas
+Wciąż i wciąż
+Będę za rękę chwytać czas
+Wciąż i wciąż
+Będę głową o strop bić
+Wciąż i wciąż
+Będę się starał lepszym być
+Wciąż i wciąż (...)
+```
