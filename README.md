@@ -61,15 +61,18 @@ laserburn_studio/
 
 ## ✒️ Uwagi Autora i Podziękowania
 
-Projekt **LaserBurn Studio** narodził się z potrzeby stworzenia narzędzia łączącego elastyczność programów graficznych z inżynierską surowością i niezawodnością sterowania maszynami CNC. Powstał w warsztacie, gdzie zapach palonego drewna, wiórów i ozonu z diody laserowej miesza się z liniami kodu pisanymi późną nocą.
+Projekt **LaserBurn Studio** narodził się z potrzeby stworzenia narzędzia łączącego elastyczność programów graficznych z inżynierską niezawodnością sterowania maszynami CNC i łatwością obsługi, skierowanej do mojego Syna. Powstał w warsztacie, gdzie zapach drewna miesza się z liniami kodu pisanymi późną nocą.
 
 Podziękowania kieruję do społeczności open-source skupionej wokół ekosystemu GRBL oraz twórców bibliotek *Shapely*, *PySide* i *svgelements*, bez których matematyka geometrii obliczeniowej wymagałaby wyważania dawno otwartych drzwi.
 
 Szczególne podziękowania kieruję do wspaniałych ludzi, którzy każdego dnia pokazują mi swoją postawą i słowem że moja praca ma sens: 
 
 S. K. (dzięki Córuś)
+
 E. K.
+
 K. M.
+
 B. G.
 
 ---
