@@ -725,7 +725,7 @@ class GCodeUploadWorker(QThread):
                 method="POST",
             )
 
-            with urllib.request.urlopen(req, timeout=10) as response:
+            with urllib.request.urlopen(req, timeout=15) as response:
                 if response.status in (200, 201):
                     self.finished_signal.emit(True, "Zadanie wysłane. Rozpoczęto wypalanie!")
                 else:
@@ -1547,14 +1547,22 @@ class LaserBurnStudio(QMainWindow):
                         if not poly:
                             continue
 
+                        # BEZPIECZEŃSTWO: Bezwzględne wygaszenie lasera przed każdym ruchem jałowym G0
+                        gcode_lines.append("M5 S0")
+                        
+                        # Przejazd szybki do punktu startowego polilinii ze zgaszoną wiązką
                         first_pt = poly[0]
                         gcode_lines.append(f"G0 X{first_pt.x():.3f} Y{first_pt.y():.3f}")
+                        
+                        # Włączenie wiązki dopiero po dojechaniu na miejsce
                         gcode_lines.append(f"M3 S{s_power}")
                         gcode_lines.append(f"G1 F{feed}")
 
+                        # Wypalanie segmentów linii
                         for pt in poly[1:]:
                             gcode_lines.append(f"G1 X{pt.x():.3f} Y{pt.y():.3f}")
 
+                        # Wyłączenie lasera natychmiast po zakończeniu polilinii
                         gcode_lines.append("M5 S0")
 
         gcode_lines.extend([
@@ -2202,6 +2210,7 @@ class LaserBurnStudio(QMainWindow):
         self.job_timer.restart()
 
         host = self.input_ws_url.text().strip()
+
         self.upload_worker = GCodeUploadWorker(host, gcode_text, filename="lasercam_job.nc")
         self.upload_worker.finished_signal.connect(self._on_upload_finished)
         self.upload_worker.start()
@@ -2211,6 +2220,9 @@ class LaserBurnStudio(QMainWindow):
             self.btn_tb_start.setEnabled(True)
             self.btn_tb_start.setText("▶")
         self.status.showMessage(message, 6000)
+        if hasattr(self, "upload_worker") and self.upload_worker is not None:
+            self.upload_worker.wait() 
+            self.upload_worker = None
 
     def new_project(self):
         reply = QMessageBox.question(
