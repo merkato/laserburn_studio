@@ -4,8 +4,7 @@ Nowoczesne środowisko CAD/CAM dedykowane dla grawerek i wycinarek laserowych op
 
 Aplikacja została zaprojektowana od podstaw z myślą o precyzyjnym pozycjonowaniu projektów na nieregularnych materiałach naturalnych (np. plastry drewna, deski oflisowe) oraz bezkompromisowej kontroli nad parametrami technologicznymi warstw.
 
-<!-- SCREENSHOT: Glowny_widok_okna.png -->
-> **Rys. 1.** *Główny pulpit roboczy LaserBurn Studio: stół 300x300 mm, podwójny pasek narzędzi (Maszyna i Edycja), wizualizacja obrysu plastra oraz panel warstw technologicznych.*
+![Zrzut ekranu aplikacji LaserBurn Studio w ciemnym motywie. Na siatce stołu roboczego widać czerwony wektorowy wzór kwiatów i liści z prostokątną ramką. Po prawej znajduje się panel Warstwy z czterema kolorowymi warstwami, a u góry paski narzędzi i menu Projekt, Edycja, Maszyna. Pasek stanu pokazuje GRBL: Rozłączony.](docs/anatomia_okna.png)
 
 ---
 
@@ -65,7 +64,7 @@ Projekt **LaserBurn Studio** narodził się z potrzeby stworzenia narzędzia ł�
 
 Podziękowania kieruję do społeczności open-source skupionej wokół ekosystemu GRBL oraz twórców bibliotek *Shapely*, *PySide* i *svgelements*, bez których matematyka geometrii obliczeniowej wymagałaby wyważania dawno otwartych drzwi.
 
-Szczególne podziękowania kieruję do wspaniałych ludzi, którzy każdego dnia pokazują mi swoją postawą i słowem że moja praca ma sens: 
+Szczególne podziękowania kieruję do wspaniałych ludzi, którzy każdego dnia pokazują mi swoją postawą i słowem że moja praca ma sens, że *Zawsze warto być przyzwoitym. Nawet jeśli się to nie opłaca*: 
 
 S. K. (dzięki Córuś)
 
@@ -80,4 +79,4 @@ B. G.
 ### 💖 Dedykacja
 
 > **Z dedykacją dla S.J.**  
-> *Każdego dnia dajesz mi siłę i wsparcie, bym zmieniał świat.*
+> *Dajesz mi siłę i wiarę w jutro. W lepsze jutro*
