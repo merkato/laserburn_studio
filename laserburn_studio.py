@@ -35,7 +35,7 @@ from PySide6.QtWebSockets import QWebSocket
 
 from svg_engine import SvgDocumentImporter
 from raster_engine import RasterImageProcessor
-from cam_engine import GCodePostProcessor
+from cam_engine import GCodePostProcessor, ToolPath
 from gcode_visualizer import GCodeVisualizerDialog
 from jog_panel import JogPanelWidget
 from rulers import CanvasWithRulers
@@ -1475,20 +1475,15 @@ class LaserBurnStudio(QMainWindow):
         return self.layers[0] if self.layers else None
 
     def _generate_gcode(self) -> list[str]:
-        """Kompilator G-code ze śledzeniem stanu maszyny, eliminujący błędy bufora i zbędne komendy."""
-        gcode_lines: list[str] = [
-            "; ==========================================",
-            "; LaserBurn Studio — Wygenerowano program G-code",
-            "; ==========================================",
-            "G21         ; Jednostki metryczne (mm)",
-            "G90         ; Pozycjonowanie absolutne",
-            "M5          ; Bezwzględne wyłączenie wiązki",
-            "G0 F6000    ; Szybki posuw przelotowy",
-        ]
+        """Kompilator G-code: zbiera geometrię ze sceny, a kolejność i emisję deleguje
+        do PathOptimizer oraz GCodePostProcessor (ze śledzeniem stanu maszyny)."""
+        post = GCodePostProcessor(s_max=1000)
+        post.reset_state((0.0, 0.0))
+        gcode_lines: list[str] = post.job_header()
 
         # 1. RASTERY (M4 - Dynamic Laser Power)
         raster_items = [
-            it for it in self.scene.items() 
+            it for it in self.scene.items()
             if isinstance(it, QGraphicsPixmapItem) and it.data(0) and it.data(0).get("type") == "raster"
             and it.isVisible()
         ]
@@ -1502,7 +1497,7 @@ class LaserBurnStudio(QMainWindow):
                     power_pct_raster = float(layer.power)
                     break
 
-            s_target_raster = int(round((power_pct_raster / 100.0) * 1000))
+            s_target_raster = post.power_pct_to_s(power_pct_raster)
 
             for item in raster_items:
                 data = item.data(0)
@@ -1511,27 +1506,27 @@ class LaserBurnStudio(QMainWindow):
                     continue
 
                 bbox = item.sceneBoundingRect()
-                origin_x = bbox.left()
-                origin_y = bbox.top()
                 h_px, w_px = binary_grid.shape
                 eff_interval_y = bbox.height() / max(1, h_px)
 
                 gcode_lines.append(f"\n; --- RASTER: {bbox.width():.1f}x{bbox.height():.1f} mm ---")
-                raster_code = RasterImageProcessor.generate_raster_gcode(
+                gcode_lines.extend(RasterImageProcessor.generate_raster_gcode(
                     binary_grid=binary_grid,
                     interval_mm=eff_interval_y,
-                    origin_x=origin_x,
-                    origin_y=origin_y,
+                    origin_x=bbox.left(),
+                    origin_y=bbox.top(),
                     feedrate=feedrate_raster,
                     s_max=s_target_raster,
                     overscan_mm=2.5
-                )
-                gcode_lines.extend(raster_code)
+                ))
+                # Raster generation may leave the controller in laser mode; force a safe state
+                # before any subsequent vector rapid moves.
+                gcode_lines.append("M5")
 
         # 2. WEKTORY (Cięcie / Grawer linii)
         vector_items = [
             it for it in self.scene.items()
-            if isinstance(it, QGraphicsPathItem) 
+            if isinstance(it, QGraphicsPathItem)
             and it not in (self.boundary_item, self.centroid_item, self.transform_box, self.guides)
             and getattr(it, 'zValue', lambda: 0)() >= 10
             and it.isVisible()
@@ -1543,127 +1538,57 @@ class LaserBurnStudio(QMainWindow):
             if layer in layer_groups:
                 layer_groups[layer].append(item)
 
-        # Inteligentne śledzenie stanu obrabiarki
-        current_x, current_y = 0.0, 0.0
-        is_laser_on = False
-        last_feed = -1
-        last_power = -1
-
         for layer, items in layer_groups.items():
             if not items or not layer.output or layer.mode.lower() == "image":
                 continue
 
             gcode_lines.append(f"\n; --- WARSTWA: {layer.name} ---")
 
-            all_subpaths = []
-            max_passes_in_layer = 1
-            
-            for item in items:
-                item_data = item.data(0) or {}
-                if "power" in item_data and "speed" in item_data:
-                    s_power = int(round((item_data["power"] / 100.0) * 1000))
-                    feed = int(item_data["speed"])
-                    passes = int(item_data.get("passes", 1))
-                else:
-                    s_power = int(round((layer.power / 100.0) * 1000))
-                    feed = int(layer.speed)
-                    passes = max(1, int(layer.passes))
-                    
-                if passes > max_passes_in_layer:
-                    max_passes_in_layer = passes
-
-                polylines = self._path_item_to_polylines(item)
-                for poly in polylines:
-                    clean_poly = []
-                    for pt in poly:
-                        # Usuwamy mikro-duplikaty punktów (<0.01mm) mogące zawieszać GRBL
-                        if not clean_poly or math.hypot(pt.x() - clean_poly[-1].x(), pt.y() - clean_poly[-1].y()) > 0.01:
-                            clean_poly.append(pt)
-                            
-                    if len(clean_poly) > 1:
-                        all_subpaths.append({
-                            "poly": clean_poly,
-                            "power": s_power,
-                            "feed": feed,
-                            "passes": passes
-                        })
-
-            if not all_subpaths:
+            toolpaths = self._collect_layer_toolpaths(layer, items, post)
+            if not toolpaths:
                 continue
+            max_passes_in_layer = max(1, max(tp.passes for tp in toolpaths))
 
-            # OPTYMALIZACJA ŚCIEŻEK (Nearest Neighbor)
-            optimized_subpaths = []
-            unvisited = list(all_subpaths)
-            search_pt = QPointF(current_x, current_y)
-            
-            while unvisited:
-                best_idx = 0
-                best_dist = float('inf')
-                for idx, path_dict in enumerate(unvisited):
-                    start_pt = path_dict["poly"][0]
-                    dist = math.hypot(start_pt.x() - search_pt.x(), start_pt.y() - search_pt.y())
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_idx = idx
-                
-                next_path = unvisited.pop(best_idx)
-                optimized_subpaths.append(next_path)
-                search_pt = next_path["poly"][-1]
+            # Optymalizacja kolejności i punktu startowego ścieżek.
+            ordered = PathOptimizer.order_nearest_neighbor(
+                [tp.coords for tp in toolpaths], start_pos=post.current_pos
+            )
+            optimized = [
+                ToolPath(coords, toolpaths[idx].s_power, toolpaths[idx].feed, toolpaths[idx].passes)
+                for idx, coords in ordered
+            ]
 
-            # GENEROWANIE PĘTLI OBRÓBCZYCH ZE ŚLEDZENIEM STANU
-            for pass_num in range(1, max_passes_in_layer + 1):
-                if max_passes_in_layer > 1:
-                    gcode_lines.append(f"; --- Powtórzenie {pass_num} z {max_passes_in_layer} ---")
-                
-                for path_dict in optimized_subpaths:
-                    if pass_num > path_dict["passes"]:
-                        continue
+            gcode_lines.extend(post.emit_vector_layer(optimized, max_passes_in_layer))
 
-                    poly = path_dict["poly"]
-                    s_power = path_dict["power"]
-                    feed = path_dict["feed"]
-
-                    first_pt = poly[0]
-                    dist_to_start = math.hypot(first_pt.x() - current_x, first_pt.y() - current_y)
-
-                    # Skok jałowy – robimy go TYLKO, jeśli faktycznie trzeba się przemieścić
-                    if dist_to_start > 0.01:
-                        if is_laser_on:
-                            gcode_lines.append("M5")
-                            is_laser_on = False
-                        gcode_lines.append(f"G0 X{first_pt.x():.3f} Y{first_pt.y():.3f}")
-                        current_x = first_pt.x()
-                        current_y = first_pt.y()
-
-                    # Włącz laser (jeśli jest zgaszony) lub zmodyfikuj moc (jeśli się zmieniła)
-                    if not is_laser_on or s_power != last_power:
-                        gcode_lines.append(f"M4 S{s_power}")
-                        is_laser_on = True
-                        last_power = s_power
-
-                    # Wypalanie segmentów (G1) z aktualizacją posuwu tylko, jeśli ten uległ zmianie
-                    for pt in poly[1:]:
-                        line = f"G1 X{pt.x():.3f} Y{pt.y():.3f}"
-                        if feed != last_feed:
-                            line += f" F{feed}"
-                            last_feed = feed
-                        gcode_lines.append(line)
-                        current_x = pt.x()
-                        current_y = pt.y()
-
-        # Po przejściu wszystkich warstw obowiązkowo gasimy laser
-        if is_laser_on:
-            gcode_lines.append("M5")
-            is_laser_on = False
-
-        gcode_lines.extend([
-            "\n; --- ZAKOŃCZENIE CYKLU ---",
-            "M5          ; Asekuracyjne wyłączenie wiązki",
-            "G0 X0 Y0    ; Powrót do bazy",
-            "M2          ; Koniec programu",
-            "; =========================================="
-        ])
+        gcode_lines.extend(post.job_footer())
         return gcode_lines
+
+    def _collect_layer_toolpaths(
+        self, layer: LayerConfig, items: list[QGraphicsPathItem], post: GCodePostProcessor
+    ) -> list[ToolPath]:
+        """Zamienia obiekty warstwy na ścieżki z parametrami (nadpisanie per-obiekt lub z warstwy)."""
+        toolpaths: list[ToolPath] = []
+        for item in items:
+            item_data = item.data(0) or {}
+            if "power" in item_data and "speed" in item_data:
+                s_power = post.power_pct_to_s(item_data["power"])
+                feed = int(item_data["speed"])
+                passes = int(item_data.get("passes", 1))
+            else:
+                s_power = post.power_pct_to_s(layer.power)
+                feed = int(layer.speed)
+                passes = max(1, int(layer.passes))
+
+            for poly in self._path_item_to_polylines(item):
+                clean: list[tuple[float, float]] = []
+                for pt in poly:
+                    # Usuwamy mikro-duplikaty punktów (<0.01mm) mogące zawieszać GRBL
+                    x, y = pt.x(), pt.y()
+                    if not clean or math.hypot(x - clean[-1][0], y - clean[-1][1]) > 0.01:
+                        clean.append((x, y))
+                if len(clean) > 1:
+                    toolpaths.append(ToolPath(clean, s_power, feed, passes))
+        return toolpaths
 
     def _export_project_gcode(self):
         lines = self._generate_gcode()

@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 import numpy as np
 from typing import List, Tuple, Optional
 from shapely.geometry import Polygon, MultiPolygon, LineString, MultiLineString, box
@@ -11,6 +12,15 @@ from path_optimizer import PathOptimizer
 from kerf_compensator import KerfCompensator
 
 
+@dataclass
+class ToolPath:
+    """Pojedyncza polilinia do obróbki wektorowej wraz z parametrami technologicznymi."""
+    coords: List[Tuple[float, float]]
+    s_power: int
+    feed: int
+    passes: int = 1
+
+
 class GCodePostProcessor:
     """
     Generator i postprocesor G-code kompatybilny ze standardem GRBL 1.1f+ dla laserów CNC.
@@ -19,6 +29,88 @@ class GCodePostProcessor:
     def __init__(self, laser_mode: str = "M4", s_max: int = 1000):
         self.laser_mode = laser_mode
         self.s_max = s_max
+        self.reset_state()
+
+    # =========================================================================
+    # 0. PROGRAM ZADANIA: NAGŁÓWEK, STOPKA I MODALNY STAN MASZYNY
+    # =========================================================================
+    def reset_state(self, start_pos: Tuple[float, float] = (0.0, 0.0)) -> None:
+        """Zeruje śledzony stan maszyny (pozycja, ostatni posuw F i moc S)."""
+        self.current_pos: Tuple[float, float] = start_pos
+        self.last_feed: Optional[int] = None
+        self.last_power: Optional[int] = None
+
+    def power_pct_to_s(self, power_pct: float) -> int:
+        """Przelicza moc w procentach na wartość S (zakres 0..s_max)."""
+        return int(round((power_pct / 100.0) * self.s_max))
+
+    def job_header(self) -> List[str]:
+        """Nagłówek programu: bezpieczny start z wyłączoną wiązką."""
+        return [
+            "; ==========================================",
+            "; LaserBurn Studio — Wygenerowano program G-code",
+            "; ==========================================",
+            "G21         ; Jednostki metryczne (mm)",
+            "G90         ; Pozycjonowanie absolutne",
+            "M5          ; Bezwzględne wyłączenie wiązki",
+            "G0 F6000    ; Szybki posuw przelotowy",
+        ]
+
+    def job_footer(self) -> List[str]:
+        """Stopka programu: końcowy bezpieczny stan, powrót do bazy i M2."""
+        return [
+            "M5",
+            "\n; --- ZAKOŃCZENIE CYKLU ---",
+            "M5          ; Asekuracyjne wyłączenie wiązki",
+            "G0 X0 Y0    ; Powrót do bazy",
+            "M2          ; Koniec programu",
+            "; ==========================================",
+        ]
+
+    def emit_vector_layer(self, toolpaths: List[ToolPath], max_passes: int) -> List[str]:
+        """
+        Generuje przejścia wektorowe dla już uporządkowanych ścieżek, śledząc stan maszyny
+        pomiędzy wywołaniami (pozycja, F, S). Zasady bezpieczeństwa:
+        M5 przed każdym szybkim G0, M4 tylko podczas cięcia G1, M5 po każdym konturze.
+        """
+        lines: List[str] = []
+
+        for pass_num in range(1, max_passes + 1):
+            if max_passes > 1:
+                lines.append(f"; --- Powtórzenie {pass_num} z {max_passes} ---")
+
+            for tp in toolpaths:
+                if pass_num > tp.passes:
+                    continue
+
+                first_pt = tp.coords[0]
+                dist_to_start = math.hypot(first_pt[0] - self.current_pos[0], first_pt[1] - self.current_pos[1])
+
+                # Nigdy nie wykonuj szybkiego przejazdu przy włączonym laserze.
+                lines.append("M5")
+                if dist_to_start > 0.01:
+                    lines.append(f"G0 X{first_pt[0]:.3f} Y{first_pt[1]:.3f}")
+                    self.current_pos = first_pt
+
+                # Aktywuj dynamiczną moc przed ruchem roboczym.
+                if tp.s_power != self.last_power:
+                    lines.append(f"M4 S{tp.s_power}")
+                    self.last_power = tp.s_power
+                else:
+                    lines.append("M4")
+
+                for pt in tp.coords[1:]:
+                    line = f"G1 X{pt[0]:.3f} Y{pt[1]:.3f}"
+                    if tp.feed != self.last_feed:
+                        line += f" F{tp.feed}"
+                        self.last_feed = tp.feed
+                    lines.append(line)
+                    self.current_pos = pt
+
+                # Zgaś wiązkę także pomiędzy niezależnymi konturami i przejściami.
+                lines.append("M5")
+
+        return lines
 
     def _header(self) -> List[str]:
         return [

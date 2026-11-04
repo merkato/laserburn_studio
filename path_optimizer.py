@@ -109,9 +109,56 @@ class PathOptimizer:
         reordered.append(reordered[0])  # Zamknięcie pętli
         return reordered
 
+    @staticmethod
+    def is_closed_path(coords: List[Tuple[float, float]], tolerance: float = 0.01) -> bool:
+        """Ścieżka jest zamknięta, gdy ma >2 punkty, a koniec leży w tolerancji od początku."""
+        return (
+            len(coords) > 2
+            and math.hypot(coords[0][0] - coords[-1][0], coords[0][1] - coords[-1][1]) <= tolerance
+        )
+
+    @classmethod
+    def order_nearest_neighbor(
+        cls,
+        paths: List[List[Tuple[float, float]]],
+        start_pos: Tuple[float, float] = (0.0, 0.0)
+    ) -> List[Tuple[int, List[Tuple[float, float]]]]:
+        """
+        Heurystyka Nearest Neighbor z optymalizacją punktu wkłucia (bez scalania i drzewa zagnieżdżeń).
+        Dla każdej kandydującej ścieżki wybiera najlepszy punkt startu (reorder_loop_start),
+        a następnie tę, której start leży najbliżej bieżącej pozycji głowicy.
+
+        Zwraca listę (indeks_wejściowy, uporządkowane_współrzędne) w kolejności obróbki,
+        aby wywołujący mógł zachować metadane powiązane ze ścieżką.
+        """
+        unvisited = list(range(len(paths)))
+        ordered: List[Tuple[int, List[Tuple[float, float]]]] = []
+        search_pt = start_pos
+
+        while unvisited:
+            best_pos = 0
+            best_dist = float('inf')
+            best_coords = None
+            for pos, path_idx in enumerate(unvisited):
+                coords = paths[path_idx]
+                candidate = cls.reorder_loop_start(coords, search_pt, cls.is_closed_path(coords))
+                start_pt = candidate[0]
+                dist = math.hypot(start_pt[0] - search_pt[0], start_pt[1] - search_pt[1])
+                if dist < best_dist:
+                    best_dist = dist
+                    best_pos = pos
+                    best_coords = candidate
+
+            path_idx = unvisited.pop(best_pos)
+            coords = best_coords if best_coords is not None else paths[path_idx]
+            ordered.append((path_idx, coords))
+            search_pt = coords[-1]
+
+        return ordered
+
     @classmethod
     def optimize(
-        cls, 
+        cls,
         input_paths: List[LineString], 
         start_head_pos: Tuple[float, float] = (0.0, 0.0)
     ) -> List[List[Tuple[float, float]]]:
