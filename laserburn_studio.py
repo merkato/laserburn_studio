@@ -22,7 +22,7 @@ from PySide6.QtGui import (
     QCursor, QAction, QKeySequence, QIcon, QClipboard, QGuiApplication
 )
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QDialog,
     QToolBar, QPushButton, QLabel, QDoubleSpinBox, QSpinBox, QComboBox,
     QCheckBox, QSlider, QTableWidget, QTableWidgetItem, QHeaderView,
     QFileDialog, QMessageBox, QColorDialog, QSplitter, QGraphicsView,
@@ -42,6 +42,7 @@ from rulers import CanvasWithRulers
 from path_optimizer import PathOptimizer
 from project_manager import ProjectSerializer
 from time_estimator import CycleTimeEstimator
+from material_tester import MaterialTestDialog
 
 
 # ==============================================================================
@@ -686,8 +687,8 @@ class LaserCrosshairItem(QGraphicsItem):
 class GCodeUploadWorker(QThread):
     finished_signal = Signal(bool, str)
 
-    def __init__(self, host_url: str, gcode_content: str, filename: str = "job.nc"):
-        super().__init__()
+    def __init__(self, host_url: str, gcode_content: str, filename: str = "job.nc", parent=None):
+        super().__init__(parent)
         clean_host = host_url.replace("ws://", "http://").replace("wss://", "https://")
         if clean_host.endswith("/ws"):
             clean_host = clean_host[:-3]
@@ -901,6 +902,11 @@ class LaserBurnStudio(QMainWindow):
         self.act_sim.setShortcut(QKeySequence("F7"))
         self.act_sim.triggered.connect(self._open_gcode_simulation)
 
+        self.act_material_test = QAction("🧪 Generator testu materiałowego...", self)
+        self.act_material_test.setShortcut(QKeySequence("Ctrl+T"))
+        self.act_material_test.setToolTip("Stwórz siatkę testową mocy, prędkości i cięcia (Ctrl+T)")
+
+
     def _setup_menus(self):
         menubar = self.menuBar()
 
@@ -933,6 +939,11 @@ class LaserBurnStudio(QMainWindow):
         menu_machine.addAction(self.act_stop)
         menu_machine.addSeparator()
         menu_machine.addAction(self.act_sim)
+        menu_machine.addAction(self.act_material_test)
+
+        # Dodanie do menu Maszyna w _setup_menus:
+        menu_machine.addAction(self.act_material_test)
+        self.act_material_test.triggered.connect(self._open_material_tester)
 
     def _setup_project_toolbar(self):
         self.proj_toolbar = QToolBar("Pasek Maszyny")
@@ -1448,24 +1459,30 @@ class LaserBurnStudio(QMainWindow):
 
         return polylines
 
-    def _find_layer_for_item(self, item: QGraphicsPathItem) -> LayerConfig:
-        """Dopasowuje obiekt do technologicznej warstwy lasera na podstawie koloru pióra."""
+    def _find_layer_for_item(self, item: QGraphicsPathItem):
+        """Dopasowuje obiekt z kanwy do warstwy technologicznej na podstawie koloru linii."""
         item_color = item.pen().color().name().upper()
+        
         for layer in self.layers:
-            if layer.color.name().upper() == item_color:
+            if hasattr(layer.color, "name"):
+                layer_color_hex = layer.color.name().upper()
+            else:
+                layer_color_hex = str(layer.color).upper()
+                
+            if layer_color_hex == item_color:
                 return layer
-        return self.layers[0]
+
+        return self.layers[0] if self.layers else None
 
     def _generate_gcode(self) -> list[str]:
-        """Generuje pełny program G-code pod GRBL z podziałem na warstwy i tryby M4/M3."""
+        """Kompilator G-code ze śledzeniem stanu maszyny, eliminujący błędy bufora i zbędne komendy."""
         gcode_lines: list[str] = [
             "; ==========================================",
             "; LaserBurn Studio — Wygenerowano program G-code",
             "; ==========================================",
             "G21         ; Jednostki metryczne (mm)",
             "G90         ; Pozycjonowanie absolutne",
-            "$32=1       ; Aktywacja trybu lasera w GRBL",
-            "M5 S0       ; Wyłączenie wiązki",
+            "M5          ; Bezwzględne wyłączenie wiązki",
             "G0 F6000    ; Szybki posuw przelotowy",
         ]
 
@@ -1511,12 +1528,12 @@ class LaserBurnStudio(QMainWindow):
                 )
                 gcode_lines.extend(raster_code)
 
-        # 2. WEKTORY (M3 - Constant Laser Power / Cut & Line)
+        # 2. WEKTORY (Cięcie / Grawer linii)
         vector_items = [
             it for it in self.scene.items()
             if isinstance(it, QGraphicsPathItem) 
             and it not in (self.boundary_item, self.centroid_item, self.transform_box, self.guides)
-            and it.zValue() >= 10
+            and getattr(it, 'zValue', lambda: 0)() >= 10
             and it.isVisible()
         ]
 
@@ -1526,49 +1543,123 @@ class LaserBurnStudio(QMainWindow):
             if layer in layer_groups:
                 layer_groups[layer].append(item)
 
+        # Inteligentne śledzenie stanu obrabiarki
+        current_x, current_y = 0.0, 0.0
+        is_laser_on = False
+        last_feed = -1
+        last_power = -1
+
         for layer, items in layer_groups.items():
             if not items or not layer.output or layer.mode.lower() == "image":
                 continue
 
-            s_power = int(round((layer.power / 100.0) * 1000))
-            feed = int(layer.speed)
-            passes = max(1, int(layer.passes))
-
             gcode_lines.append(f"\n; --- WARSTWA: {layer.name} ---")
-            gcode_lines.append(f"; Tryb: {layer.mode}, F: {feed} mm/min, Moc: {s_power} ({layer.power}%), Powtórzenia: {passes}")
 
-            for pass_num in range(1, passes + 1):
-                if passes > 1:
-                    gcode_lines.append(f"; Powtórzenie {pass_num} z {passes}")
+            all_subpaths = []
+            max_passes_in_layer = 1
+            
+            for item in items:
+                item_data = item.data(0) or {}
+                if "power" in item_data and "speed" in item_data:
+                    s_power = int(round((item_data["power"] / 100.0) * 1000))
+                    feed = int(item_data["speed"])
+                    passes = int(item_data.get("passes", 1))
+                else:
+                    s_power = int(round((layer.power / 100.0) * 1000))
+                    feed = int(layer.speed)
+                    passes = max(1, int(layer.passes))
+                    
+                if passes > max_passes_in_layer:
+                    max_passes_in_layer = passes
 
-                for item in items:
-                    polylines = self._path_item_to_polylines(item)
-                    for poly in polylines:
-                        if not poly:
-                            continue
+                polylines = self._path_item_to_polylines(item)
+                for poly in polylines:
+                    clean_poly = []
+                    for pt in poly:
+                        # Usuwamy mikro-duplikaty punktów (<0.01mm) mogące zawieszać GRBL
+                        if not clean_poly or math.hypot(pt.x() - clean_poly[-1].x(), pt.y() - clean_poly[-1].y()) > 0.01:
+                            clean_poly.append(pt)
+                            
+                    if len(clean_poly) > 1:
+                        all_subpaths.append({
+                            "poly": clean_poly,
+                            "power": s_power,
+                            "feed": feed,
+                            "passes": passes
+                        })
 
-                        # BEZPIECZEŃSTWO: Bezwzględne wygaszenie lasera przed każdym ruchem jałowym G0
-                        gcode_lines.append("M5 S0")
-                        
-                        # Przejazd szybki do punktu startowego polilinii ze zgaszoną wiązką
-                        first_pt = poly[0]
+            if not all_subpaths:
+                continue
+
+            # OPTYMALIZACJA ŚCIEŻEK (Nearest Neighbor)
+            optimized_subpaths = []
+            unvisited = list(all_subpaths)
+            search_pt = QPointF(current_x, current_y)
+            
+            while unvisited:
+                best_idx = 0
+                best_dist = float('inf')
+                for idx, path_dict in enumerate(unvisited):
+                    start_pt = path_dict["poly"][0]
+                    dist = math.hypot(start_pt.x() - search_pt.x(), start_pt.y() - search_pt.y())
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_idx = idx
+                
+                next_path = unvisited.pop(best_idx)
+                optimized_subpaths.append(next_path)
+                search_pt = next_path["poly"][-1]
+
+            # GENEROWANIE PĘTLI OBRÓBCZYCH ZE ŚLEDZENIEM STANU
+            for pass_num in range(1, max_passes_in_layer + 1):
+                if max_passes_in_layer > 1:
+                    gcode_lines.append(f"; --- Powtórzenie {pass_num} z {max_passes_in_layer} ---")
+                
+                for path_dict in optimized_subpaths:
+                    if pass_num > path_dict["passes"]:
+                        continue
+
+                    poly = path_dict["poly"]
+                    s_power = path_dict["power"]
+                    feed = path_dict["feed"]
+
+                    first_pt = poly[0]
+                    dist_to_start = math.hypot(first_pt.x() - current_x, first_pt.y() - current_y)
+
+                    # Skok jałowy – robimy go TYLKO, jeśli faktycznie trzeba się przemieścić
+                    if dist_to_start > 0.01:
+                        if is_laser_on:
+                            gcode_lines.append("M5")
+                            is_laser_on = False
                         gcode_lines.append(f"G0 X{first_pt.x():.3f} Y{first_pt.y():.3f}")
-                        
-                        # Włączenie wiązki dopiero po dojechaniu na miejsce
-                        gcode_lines.append(f"M3 S{s_power}")
-                        gcode_lines.append(f"G1 F{feed}")
+                        current_x = first_pt.x()
+                        current_y = first_pt.y()
 
-                        # Wypalanie segmentów linii
-                        for pt in poly[1:]:
-                            gcode_lines.append(f"G1 X{pt.x():.3f} Y{pt.y():.3f}")
+                    # Włącz laser (jeśli jest zgaszony) lub zmodyfikuj moc (jeśli się zmieniła)
+                    if not is_laser_on or s_power != last_power:
+                        gcode_lines.append(f"M4 S{s_power}")
+                        is_laser_on = True
+                        last_power = s_power
 
-                        # Wyłączenie lasera natychmiast po zakończeniu polilinii
-                        gcode_lines.append("M5 S0")
+                    # Wypalanie segmentów (G1) z aktualizacją posuwu tylko, jeśli ten uległ zmianie
+                    for pt in poly[1:]:
+                        line = f"G1 X{pt.x():.3f} Y{pt.y():.3f}"
+                        if feed != last_feed:
+                            line += f" F{feed}"
+                            last_feed = feed
+                        gcode_lines.append(line)
+                        current_x = pt.x()
+                        current_y = pt.y()
+
+        # Po przejściu wszystkich warstw obowiązkowo gasimy laser
+        if is_laser_on:
+            gcode_lines.append("M5")
+            is_laser_on = False
 
         gcode_lines.extend([
             "\n; --- ZAKOŃCZENIE CYKLU ---",
-            "M5 S0       ; Wyłączenie wiązki",
-            "G0 X0 Y0    ; Powrót do bazy (WPos 0,0)",
+            "M5          ; Asekuracyjne wyłączenie wiązki",
+            "G0 X0 Y0    ; Powrót do bazy",
             "M2          ; Koniec programu",
             "; =========================================="
         ])
@@ -1701,6 +1792,12 @@ class LaserBurnStudio(QMainWindow):
         self.layer_table.verticalHeader().setDefaultSectionSize(28)
 
         for r, layer in enumerate(self.layers):
+            if hasattr(layer.color, "name"):
+                layer_color_hex = layer.color.name().upper()
+            else:
+                layer_color_hex = str(layer.color).upper()
+                
+            qt_color = QColor(layer_color_hex)        
             self.layer_table.setRowHeight(r, 28)
 
             for c in range(7):
@@ -1708,10 +1805,15 @@ class LaserBurnStudio(QMainWindow):
 
             name_item = self.layer_table.item(r, 0)
             name_item.setText(f"■ {layer.name}")
-            if layer.color.name().upper() in ("#000000", "#111111"):
-                name_item.setForeground(QColor("#FFFFFF"))
+            
+            # Logika kontrastu tekstu
+            if layer_color_hex in ("#000000", "#111111"):
+                text_color = QColor(255, 255, 255)
             else:
-                name_item.setForeground(layer.color)
+                text_color = QColor(220, 220, 220)
+                
+            # Ustawienie kolorów: czcionki z tekstem na wyliczony kontrast, a tła lub ikony na qt_color (tu ustawiamy kolor samego znaku kwadratu i tekstu)
+            name_item.setForeground(qt_color)
             name_item.setFont(QFont("Segoe UI", 9, QFont.Bold))
             name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
 
@@ -2210,8 +2312,13 @@ class LaserBurnStudio(QMainWindow):
         self.job_timer.restart()
 
         host = self.input_ws_url.text().strip()
-
-        self.upload_worker = GCodeUploadWorker(host, gcode_text, filename="lasercam_job.nc")
+        
+        # 1. Jeśli istnieje stary obiekt poprzedniego zadania, spokojnie poczekaj aż zamknie porty
+        if hasattr(self, "upload_worker") and self.upload_worker is not None:
+            self.upload_worker.wait()
+            
+        # 2. Przekazujemy "parent=self", co chroni obiekt przed przedwczesnym zniszczeniem (Crash Ochrony Pamięci)
+        self.upload_worker = GCodeUploadWorker(host, gcode_text, filename="lasercam_job.nc", parent=self)
         self.upload_worker.finished_signal.connect(self._on_upload_finished)
         self.upload_worker.start()
 
@@ -2220,10 +2327,7 @@ class LaserBurnStudio(QMainWindow):
             self.btn_tb_start.setEnabled(True)
             self.btn_tb_start.setText("▶")
         self.status.showMessage(message, 6000)
-        if hasattr(self, "upload_worker") and self.upload_worker is not None:
-            self.upload_worker.wait() 
-            self.upload_worker = None
-
+        
     def new_project(self):
         reply = QMessageBox.question(
             self, "Nowy projekt", "Czy na pewno chcesz utworzyć nowy projekt? Niezapisane zmiany zostaną utracone.",
@@ -2275,7 +2379,60 @@ class LaserBurnStudio(QMainWindow):
             self.status.showMessage(f"Projekt wczytany: {file_path}", 5000)
         except Exception as e:
             QMessageBox.critical(self, "Błąd odczytu", f"Nie udało się wczytać projektu:\n{e}")
+   
+    def _open_material_tester(self):
+        """Otwiera generator testu, wstawia geometrię i przebudowuje QTableWidget z warstwami testu."""
+        from material_tester import MaterialTestDialog
+        dialog = MaterialTestDialog(self)
+        if dialog.exec() == QDialog.Accepted:
+            insert_pos = QPointF(10.0, 10.0)
+            if hasattr(self, "shapely_material_poly") and self.shapely_material_poly:
+                c = self.shapely_material_poly.centroid
+                insert_pos = QPointF(float(c.x) - 50.0, float(c.y) - 50.0)
 
+            # Pobranie nowej geometrii oraz definicji 100% poprawnych warstw
+            test_items, new_layers_data = dialog.generate_test_data(start_pos=insert_pos)
+            
+            self.scene.clearSelection()
+
+            # 1. ZAMIENIAMY TABELĘ WARSTW W GŁÓWNYM PROGRAMIE
+            self.layers.clear()
+            
+            # Dodanie warstwy domyślnej, która wypali nam same napisy z etykietami
+            label_layer = LayerConfig(
+                name="Opisy osi (Grawer)", 
+                color="#00FFFF", 
+                speed=3000, 
+                power=20, 
+                passes=1, 
+                mode="Line"
+            )
+            label_layer.output = True
+            self.layers.append(label_layer)
+            
+            # Rejestracja unikalnych warstw ze wszystkich komórek testu
+            for l_data in new_layers_data:
+                layer = LayerConfig(
+                    name=l_data["name"],
+                    color=l_data["color"],
+                    speed=l_data["speed"],
+                    power=l_data["power"],
+                    passes=l_data["passes"],
+                    mode=l_data["mode"]
+                )
+                layer.output = l_data.get("output", True)
+                self.layers.append(layer)
+                
+            # Wymuszenie przebudowania QTableWidget za pomocą istniejącej metody
+            if hasattr(self, "_populate_layer_table"):
+                self._populate_layer_table()
+
+            # 2. Rzucenie kształtów na ekran
+            for item in test_items:
+                self.scene.addItem(item)
+                item.setSelected(True)
+
+            self.status.showMessage(f"Test wczytany pomyślnie. Wygenerowano {len(new_layers_data)} unikalnych warstw dla maszyny.", 6000)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
