@@ -1508,23 +1508,27 @@ class LaserBurnStudio(QMainWindow):
                 if binary_grid is None:
                     continue
 
-                bbox = item.sceneBoundingRect()
+                # Dokładny obszar pikseli (bez marginesu sceneBoundingRect); krok X i Y osobno,
+                # bo raster mógł zostać przeskalowany nieproporcjonalnie.
+                rect = RasterImageProcessor.grid_scene_rect(item)
                 h_px, w_px = binary_grid.shape
-                eff_interval_y = bbox.height() / max(1, h_px)
 
-                gcode_lines.append(f"\n; --- RASTER: {bbox.width():.1f}x{bbox.height():.1f} mm ---")
-                gcode_lines.extend(RasterImageProcessor.generate_raster_gcode(
+                gcode_lines.append(f"\n; --- RASTER: {rect.width():.1f}x{rect.height():.1f} mm ---")
+                raster_code = RasterImageProcessor.generate_raster_gcode(
                     binary_grid=binary_grid,
-                    interval_mm=eff_interval_y,
-                    origin_x=bbox.left(),
-                    origin_y=bbox.top(),
+                    interval_mm=rect.width() / max(1, w_px),
+                    interval_y_mm=rect.height() / max(1, h_px),
+                    origin_x=rect.left(),
+                    origin_y=rect.top(),
                     feedrate=feedrate_raster,
                     s_max=s_target_raster,
                     overscan_mm=2.5
-                ))
-                # Raster generation may leave the controller in laser mode; force a safe state
-                # before any subsequent vector rapid moves.
-                gcode_lines.append("M5")
+                )
+                gcode_lines.extend(raster_code)
+                # Blok kończy się M5; F i S zostały zmienione – postprocesor musi znać
+                # faktyczną pozycję głowicy, aby nie pominąć G0 przed pierwszym wektorem.
+                end_pos = RasterImageProcessor.end_position(raster_code)
+                post.reset_state(end_pos if end_pos is not None else post.current_pos)
 
         # 2. WEKTORY (Cięcie / Grawer linii)
         vector_items = [
@@ -2233,7 +2237,9 @@ class LaserBurnStudio(QMainWindow):
                 c = self.shapely_material_poly.centroid
                 pos = QPointF(float(c.x), float(c.y))
 
-            item, dithered_pil, grid = processor.load_raster(path, initial_pos=pos, apply_dither=True)
+            item, _, grid = processor.load_raster(
+                path, initial_pos=pos, apply_dither=True, fit_within_mm=(self.bed_w, self.bed_h)
+            )
             self.scene.addItem(item)
             
             self.scene.clearSelection()
