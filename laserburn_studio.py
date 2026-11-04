@@ -50,14 +50,17 @@ from material_tester import MaterialTestDialog
 # ==============================================================================
 
 class LayerConfig:
-    def __init__(self, name: str, color: QColor, mode: str = "Line", speed: float = 1200.0, power: float = 80.0, passes: int = 1, kerf: float = 0.15):
+    def __init__(self, name: str, color: QColor, mode: str = "Line", speed: float = 1200.0, power: float = 80.0, passes: int = 1, kerf: float = 0.15,
+                 hatch_interval: float = 0.1, hatch_angle: float = 0.0):
         self.name = name
-        self.color = color
+        self.color = QColor(color)  # Akceptuje QColor lub zapis "#RRGGBB"
         self.mode = mode         # "Line", "Fill", "Image"
         self.speed = speed       # mm/min
         self.power = power       # %
         self.passes = passes
         self.kerf = kerf         # Szerokość rzazu w mm
+        self.hatch_interval = hatch_interval  # Fill: odstęp linii kreskowania w mm
+        self.hatch_angle = hatch_angle        # Fill: kąt kreskowania w stopniach
         self.output = True
         self.visible = True
 
@@ -1530,6 +1533,7 @@ class LaserBurnStudio(QMainWindow):
             and it not in (self.boundary_item, self.centroid_item, self.transform_box, self.guides)
             and getattr(it, 'zValue', lambda: 0)() >= 10
             and it.isVisible()
+            and not self._is_guide_item(it)
         ]
 
         layer_groups: dict[LayerConfig, list[QGraphicsPathItem]] = {l: [] for l in self.layers}
@@ -1543,6 +1547,10 @@ class LaserBurnStudio(QMainWindow):
                 continue
 
             gcode_lines.append(f"\n; --- WARSTWA: {layer.name} ---")
+
+            if layer.mode.lower() == "fill":
+                gcode_lines.extend(self._emit_fill_layer(layer, items, post))
+                continue
 
             toolpaths = self._collect_layer_toolpaths(layer, items, post)
             if not toolpaths:
@@ -1562,6 +1570,77 @@ class LaserBurnStudio(QMainWindow):
 
         gcode_lines.extend(post.job_footer())
         return gcode_lines
+
+    @staticmethod
+    def _is_guide_item(item: QGraphicsItem) -> bool:
+        """Obiekty pomocnicze (np. obrys arkusza testu) są widoczne na kanwie, ale nie są wypalane."""
+        data = item.data(0)
+        return isinstance(data, dict) and data.get("type") == "guide"
+
+    def _item_to_fill_polygons(self, item: QGraphicsPathItem) -> list[Polygon]:
+        """
+        Zamienia obiekt na wielokąty do kreskowania, łącząc podścieżki regułą even-odd,
+        dzięki czemu otwory (np. wnętrza liter, pierścienie) pozostają niewypełnione.
+        """
+        region = None
+        for poly in self._path_item_to_polylines(item):
+            coords = [(pt.x(), pt.y()) for pt in poly]
+            if len(coords) < 3:
+                continue
+            ring = Polygon(coords)
+            if not ring.is_valid:
+                ring = ring.buffer(0)
+            if ring.is_empty or ring.area <= 0:
+                continue
+            region = ring if region is None else region.symmetric_difference(ring)
+
+        if region is None or region.is_empty:
+            return []
+        if isinstance(region, Polygon):
+            return [region]
+        return [g for g in getattr(region, "geoms", []) if isinstance(g, Polygon) and not g.is_empty]
+
+    def _emit_fill_layer(
+        self, layer: LayerConfig, items: list[QGraphicsPathItem], post: GCodePostProcessor
+    ) -> list[str]:
+        """Kreskowanie (Fill/Hatch) obiektów warstwy z kolejnością obiektów wg Nearest Neighbor."""
+        jobs = []  # (polygons, power_pct, feed, passes)
+        for item in items:
+            polys = self._item_to_fill_polygons(item)
+            if not polys:
+                continue
+            item_data = item.data(0) or {}
+            if "power" in item_data and "speed" in item_data:
+                power_pct = float(item_data["power"])
+                feed = float(item_data["speed"])
+                passes = int(item_data.get("passes", 1))
+            else:
+                power_pct = float(layer.power)
+                feed = float(layer.speed)
+                passes = max(1, int(layer.passes))
+            jobs.append((polys, power_pct, feed, passes))
+
+        if not jobs:
+            return ["; Brak zamkniętych konturów do wypełnienia"]
+
+        # Kolejność obiektów: najbliższy obrys względem aktualnej pozycji głowicy
+        outlines = [list(job[0][0].exterior.coords) for job in jobs]
+        order = [idx for idx, _ in PathOptimizer.order_nearest_neighbor(outlines, start_pos=post.current_pos)]
+
+        interval = max(0.01, float(getattr(layer, "hatch_interval", 0.1)))
+        angle = float(getattr(layer, "hatch_angle", 0.0))
+        max_passes = max(job[3] for job in jobs)
+
+        lines: list[str] = []
+        for pass_num in range(1, max_passes + 1):
+            if max_passes > 1:
+                lines.append(f"; --- Powtórzenie {pass_num} z {max_passes} ---")
+            for idx in order:
+                polys, power_pct, feed, passes = jobs[idx]
+                if pass_num > passes:
+                    continue
+                lines.extend(post.generate_fill_hatch(polys, interval, angle, feed, power_pct))
+        return lines
 
     def _collect_layer_toolpaths(
         self, layer: LayerConfig, items: list[QGraphicsPathItem], post: GCodePostProcessor
@@ -2343,7 +2422,9 @@ class LaserBurnStudio(QMainWindow):
                     speed=l_data["speed"],
                     power=l_data["power"],
                     passes=l_data["passes"],
-                    mode=l_data["mode"]
+                    mode=l_data["mode"],
+                    hatch_interval=l_data.get("hatch_interval", 0.1),
+                    hatch_angle=l_data.get("hatch_angle", 0.0)
                 )
                 layer.output = l_data.get("output", True)
                 self.layers.append(layer)

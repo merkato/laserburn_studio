@@ -88,6 +88,23 @@ class MaterialTestDialog(QDialog):
         self.spin_passes.setValue(2)
         self.grid_params.addWidget(self.spin_passes, 3, 1)
 
+        # Parametry kreskowania (tylko test wypełnienia)
+        self.grid_params.addWidget(QLabel("Kreskowanie: odstęp [mm] / kąt [°]:"), 4, 0)
+        h_hatch = QHBoxLayout()
+        self.spin_hatch_interval = QDoubleSpinBox()
+        self.spin_hatch_interval.setRange(0.02, 2.0)
+        self.spin_hatch_interval.setSingleStep(0.02)
+        self.spin_hatch_interval.setDecimals(2)
+        self.spin_hatch_interval.setValue(0.1)
+        self.spin_hatch_angle = QDoubleSpinBox()
+        self.spin_hatch_angle.setRange(0.0, 179.0)
+        self.spin_hatch_angle.setDecimals(0)
+        self.spin_hatch_angle.setValue(0.0)
+        h_hatch.addWidget(self.spin_hatch_interval); h_hatch.addWidget(QLabel("/")); h_hatch.addWidget(self.spin_hatch_angle)
+        self.grid_params.addLayout(h_hatch, 4, 1)
+        self.spin_hatch_interval.setEnabled(False)
+        self.spin_hatch_angle.setEnabled(False)
+
         main_layout.addWidget(self.box_params)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -104,6 +121,34 @@ class MaterialTestDialog(QDialog):
             self.spin_smin.setValue(1000); self.spin_smax.setValue(4000)
             self.spin_pmin.setValue(20); self.spin_pmax.setValue(60)
             self.spin_passes.setValue(1); self.spin_passes.setEnabled(False)
+        is_fill = index == 1
+        self.spin_hatch_interval.setEnabled(is_fill)
+        self.spin_hatch_angle.setEnabled(is_fill)
+
+    @staticmethod
+    def _unique_cell_colors(count: int, reserved: Tuple[str, ...] = ()) -> List[QColor]:
+        """
+        Kolor komórki jednoznacznie wskazuje warstwę (także po zapisie projektu),
+        więc każda komórka musi mieć inny kolor. Przy kolizji odcienia zmieniana jest jasność.
+        """
+        used = {c.lower() for c in reserved}
+        colors: List[QColor] = []
+        for k in range(count):
+            hue = int((k / max(1, count)) * 320)
+            lightness = 150
+            color = QColor.fromHsl(hue, 200, lightness)
+            step = 0
+            while color.name() in used:
+                step += 1
+                lightness = 150 + (step // 2 + 1) * 8 * (1 if step % 2 else -1)
+                if not 40 <= lightness <= 215:
+                    hue = (hue + 1) % 360
+                    step = 0
+                    lightness = 150
+                color = QColor.fromHsl(hue, 200, lightness)
+            used.add(color.name())
+            colors.append(color)
+        return colors
 
     def generate_test_data(self, start_pos: QPointF = QPointF(10.0, 10.0)) -> Tuple[List[QGraphicsItem], List[dict]]:
         items: List[QGraphicsItem] = []
@@ -117,6 +162,7 @@ class MaterialTestDialog(QDialog):
         sheet_item = QGraphicsPathItem(sheet_path)
         sheet_item.setPen(QPen(QColor("#808080"), 0.8, Qt.DashLine))
         sheet_item.setZValue(10)
+        sheet_item.setData(0, {"type": "guide"})  # Tylko podgląd – nie jest wypalany
         items.append(sheet_item)
 
         pmin, pmax = self.spin_pmin.value(), self.spin_pmax.value()
@@ -164,15 +210,15 @@ class MaterialTestDialog(QDialog):
 
         # 4. Generowanie komórek testowych (kwadratów) i dynamicznych warstw
         layer_counter = 0
+        cell_colors = self._unique_cell_colors(steps_p * steps_s, reserved=("#00ffff", "#808080"))
         for i in range(steps_p):
             for j in range(steps_s):
                 power_val = pmin + (pmax - pmin) * (i / max(1, steps_p - 1))
                 speed_val = smin + (smax - smin) * (j / max(1, steps_s - 1))
 
-                # Unikalny kolor dla każdej komórki, bazujący na HSL
-                hue = int((layer_counter / (steps_p * steps_s)) * 320)
-                color = QColor.fromHsl(hue, 200, 150)
-                
+                # Unikalny kolor dla każdej komórki (kolor = przypisanie do warstwy)
+                color = cell_colors[layer_counter]
+
                 layer_configs.append({
                     "name": f"P{int(power_val)} S{int(speed_val)}",
                     "color": color.name(),
@@ -180,6 +226,8 @@ class MaterialTestDialog(QDialog):
                     "power": float(power_val),
                     "passes": int(self.spin_passes.value()),
                     "mode": "Fill" if is_fill_test else "Line",
+                    "hatch_interval": float(self.spin_hatch_interval.value()),
+                    "hatch_angle": float(self.spin_hatch_angle.value()),
                     "output": True
                 })
 

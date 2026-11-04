@@ -88,6 +88,8 @@ class ProjectSerializer:
                 "power": l.power,
                 "passes": l.passes,
                 "kerf": l.kerf,
+                "hatch_interval": getattr(l, "hatch_interval", 0.1),
+                "hatch_angle": getattr(l, "hatch_angle", 0.0),
                 "output": l.output
             })
 
@@ -106,14 +108,19 @@ class ProjectSerializer:
 
             if isinstance(it, QGraphicsPathItem):
                 d_str = path_to_svg_d(it.path())
-                items_data.append({
+                vec = {
                     "type": "vector",
                     "svg_d": d_str,
                     "color": it.pen().color().name(),
                     "pos_x": it.pos().x(),
                     "pos_y": it.pos().y(),
                     "transform": trans_matrix
-                })
+                }
+                # Obiekty pomocnicze (np. obrys arkusza testu) nie trafiają do G-code
+                it_data = it.data(0)
+                if isinstance(it_data, dict) and it_data.get("type") == "guide":
+                    vec["role"] = "guide"
+                items_data.append(vec)
 
             elif isinstance(it, QGraphicsPixmapItem):
                 pix = it.pixmap()
@@ -168,7 +175,9 @@ class ProjectSerializer:
                 speed=float(ld.get("speed", 1000.0)),
                 power=float(ld.get("power", 50.0)),
                 passes=int(ld.get("passes", 1)),
-                kerf=float(ld.get("kerf", 0.0))
+                kerf=float(ld.get("kerf", 0.0)),
+                hatch_interval=float(ld.get("hatch_interval", 0.1)),
+                hatch_angle=float(ld.get("hatch_angle", 0.0))
             )
             layer.output = bool(ld.get("output", True))
             studio.layers.append(layer)
@@ -194,6 +203,8 @@ class ProjectSerializer:
                 path_item.setTransform(trans)
                 path_item.setZValue(15)
                 path_item.setFlag(QGraphicsItem.ItemIsSelectable, True)
+                if idata.get("role") == "guide":
+                    path_item.setData(0, {"type": "guide"})
                 studio.scene.addItem(path_item)
 
             elif itype == "raster":

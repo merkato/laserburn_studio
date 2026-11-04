@@ -175,10 +175,14 @@ class GCodePostProcessor:
                 # Kolejne punkty (modalne G1, F i S)
                 for pt in subpath[2:]:
                     lines.append(f"G1 X{pt[0]:.3f} Y{pt[1]:.3f}")
+                self.current_pos = (subpath[-1][0], subpath[-1][1])
 
                 # Zgaś wiązkę po każdym konturze
                 lines.append("M5")
 
+        # Metoda emituje własne F i S – kolejny blok musi je ustawić ponownie
+        self.last_feed = None
+        self.last_power = None
         return lines
 
     # =========================================================================
@@ -245,8 +249,13 @@ class GCodePostProcessor:
             lines.append(f"G0 X{pts[0][0]:.3f} Y{pts[0][1]:.3f}")
             lines.append(f"M4 S{s_val}")
             lines.append(f"G1 X{pts[1][0]:.3f} Y{pts[1][1]:.3f} F{feed:.1f}")
+            self.current_pos = (pts[1][0], pts[1][1])
             reverse = not reverse
         lines.append("M5")
+
+        # Metoda emituje własne F i S – kolejny blok musi je ustawić ponownie
+        self.last_feed = None
+        self.last_power = None
 
         return lines
     # =========================================================================
