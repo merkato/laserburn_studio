@@ -25,6 +25,16 @@ class RasterImageProcessor:
         gray = image.convert("L")
         return gray.convert("1", dither=Image.Dither.FLOYDSTEINBERG)
 
+    @staticmethod
+    def grid_to_pixmap(binary_grid: np.ndarray) -> QPixmap:
+        """Podgląd siatki wypalania: piksel 1 = ciemny, 0 = przezroczysty."""
+        grid = np.ascontiguousarray(binary_grid)
+        h, w = grid.shape
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[grid == 1] = [20, 20, 20, 240]
+        qimg = QImage(rgba.data, w, h, w * 4, QImage.Format.Format_RGBA8888)
+        return QPixmap.fromImage(qimg.copy())
+
     def load_raster(
         self,
         file_path: str,
@@ -48,17 +58,8 @@ class RasterImageProcessor:
         # Tablica binarna: 1 = wypalenie, 0 = brak
         binary_grid = (np.array(dithered_pil) == False).astype(np.uint8)
 
-        # Generowanie QImage z przezroczystością
         h, w = binary_grid.shape
-        rgba = np.zeros((h, w, 4), dtype=np.uint8)
-        burn_mask = (binary_grid == 1)
-        rgba[burn_mask] = [20, 20, 20, 240]
-        rgba[~burn_mask] = [0, 0, 0, 0]
-
-        qimg = QImage(rgba.data, w, h, w * 4, QImage.Format.Format_RGBA8888)
-        pixmap = QPixmap.fromImage(qimg.copy())
-
-        item = QGraphicsPixmapItem(pixmap)
+        item = QGraphicsPixmapItem(self.grid_to_pixmap(binary_grid))
         item.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
             QGraphicsItem.GraphicsItemFlag.ItemIsMovable |

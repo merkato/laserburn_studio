@@ -1,252 +1,338 @@
 from __future__ import annotations
-import math
 import re
-import xml.etree.ElementTree as ET
-from typing import List, Optional, Dict, Any
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 
-from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import (
-    QPainterPath, QTransform, QFont, QFontMetricsF, 
-    QPen, QColor
-)
+from PySide6.QtCore import QPointF
+from PySide6.QtGui import QPainterPath, QTransform, QFont, QFontMetricsF, QPen, QColor
 from PySide6.QtWidgets import QGraphicsPathItem, QGraphicsItem
 import svgelements
 
 
+MM_PER_INCH = 25.4
+CSS_PX_PER_INCH = 96.0       # Standard CSS/SVG (Inkscape, przeglądarki, CorelDRAW, Affinity)
+ILLUSTRATOR_PX_PER_INCH = 72.0  # Adobe Illustrator zapisuje punkty typograficzne jako "px"
+
+# Rozmiar wzorcowy czcionki przy zamianie tekstu na krzywe (duży = dokładne krzywe glifów)
+_REF_FONT_PX = 1000
+
+
+@dataclass
+class SvgImportReport:
+    """Podsumowanie importu – co weszło, co pominięto i dlaczego."""
+    file_path: str = ""
+    imported: int = 0
+    texts: int = 0
+    skipped_hidden: int = 0
+    skipped_invisible: int = 0
+    skipped_images: int = 0
+    skipped_empty: int = 0
+    errors: List[str] = field(default_factory=list)
+    px_per_inch: float = CSS_PX_PER_INCH
+    page_size_mm: Tuple[float, float] = (0.0, 0.0)
+    generator: str = ""
+
+    def summary(self) -> str:
+        parts = [f"obiektów: {self.imported}"]
+        if self.texts:
+            parts.append(f"tekstów: {self.texts}")
+        skipped = self.skipped_hidden + self.skipped_invisible + self.skipped_images + self.skipped_empty
+        if skipped:
+            parts.append(f"pominięto: {skipped}")
+        if self.px_per_inch != CSS_PX_PER_INCH:
+            parts.append(f"{self.px_per_inch:.0f} DPI")
+        if self.errors:
+            parts.append(f"błędy: {len(self.errors)}")
+        return ", ".join(parts)
+
+
 class SvgDocumentImporter:
     """
-    Dedykowany silnik wektorowy SVG dla LaserBurn Studio.
-    Odpowiada za import, konwersję czcionek do ścieżek oraz skalowanie DPI -> mm.
+    Import SVG dla LaserBurn Studio, oparty w całości na svgelements:
+    - jednostki dokumentu (mm/cm/in/pt/px) oraz viewBox -> milimetry stołu,
+    - wykrywanie Adobe Illustrator (72 DPI zapisane jako "px"),
+    - pełne dziedziczenie stylów, transformacje grup, <use>/<symbol>, klasy CSS,
+    - pomijanie elementów ukrytych (display:none, visibility:hidden) i niewidocznych,
+    - zachowanie położenia obiektów względem strony (lewy dolny róg strony = X0 Y0 stołu),
+    - zachowanie kolorów: obrys (stroke), a gdy go brak – wypełnienie (fill); tekst: fill.
     """
 
-    def __init__(self, default_pen: Optional[QPen] = None):
+    def __init__(self, default_pen: Optional[QPen] = None, px_per_inch: Optional[float] = None):
         if default_pen:
-            self.pen = default_pen
+            self.pen = QPen(default_pen)
         else:
             self.pen = QPen(QColor(255, 0, 0), 1.0)
-            self.pen.setCosmetic(True)
+        self.pen.setCosmetic(True)
+        self.px_per_inch_override = px_per_inch
+        self.last_report = SvgImportReport()
+
+    # =========================================================================
+    # JEDNOSTKI I WYKRYWANIE GENERATORA
+    # =========================================================================
+    @staticmethod
+    def _read_head(file_path: str, limit: int = 4096) -> str:
+        try:
+            with open(file_path, "rb") as f:
+                return f.read(limit).decode("utf-8", errors="ignore")
+        except OSError:
+            return ""
+
+    @classmethod
+    def detect_px_per_inch(cls, file_path: str) -> Tuple[float, str]:
+        """
+        Zwraca (px_na_cal, generator). Illustrator zapisuje wymiary w punktach (1/72 cala)
+        z jednostką "px" lub bez jednostki – wtedy 1 px = 1/72 cala. Gdy wymiary mają jednostki
+        fizyczne (mm, cm, in, pt), svgelements przelicza je poprawnie i obowiązuje 96 DPI.
+        """
+        head = cls._read_head(file_path)
+        generator = ""
+        m = re.search(r"Generator:\s*([^\r\n>]+?)\s*(?:-->|,|$)", head)
+        if m:
+            generator = m.group(1).strip()
+        elif "Inkscape" in head or "inkscape" in head:
+            generator = "Inkscape"
+
+        if "Adobe Illustrator" in head:
+            m_svg = re.search(r"<svg\b[^>]*>", head, re.S)
+            svg_tag = m_svg.group(0) if m_svg else ""
+            m_w = re.search(r'\swidth\s*=\s*"([^"]*)"', svg_tag)
+            width_attr = m_w.group(1).strip() if m_w else ""
+            unit = re.sub(r"[-+0-9.eE\s]", "", width_attr).lower()
+            if unit in ("", "px"):
+                return ILLUSTRATOR_PX_PER_INCH, generator or "Adobe Illustrator"
+        return CSS_PX_PER_INCH, generator
+
+    # =========================================================================
+    # KOLORY I WIDOCZNOŚĆ
+    # =========================================================================
+    @staticmethod
+    def _svg_color(value) -> Optional[QColor]:
+        """Kolor svgelements -> nieprzezroczysty QColor (bez kanału alfa, aby nie mylić warstw)."""
+        if value is None or not isinstance(value, svgelements.Color) or value.value is None:
+            return None
+        return QColor(int(value.red), int(value.green), int(value.blue))
 
     @staticmethod
-    def parse_transform(transform_str: str) -> QTransform:
-        """Parsuje macierze i przekształcenia afiniczne SVG."""
-        t = QTransform()
-        if not transform_str:
-            return t
-
-        operations = re.findall(r'([a-zA-Z]+)\s*\(([^)]+)\)', transform_str)
-        for op, params_str in operations:
-            params = [float(p) for p in re.split(r'[\s,]+', params_str.strip()) if p]
-            if op == 'matrix' and len(params) == 6:
-                a, b, c, d, e, f = params
-                t = QTransform(a, b, c, d, e, f) * t
-            elif op == 'translate':
-                dx = params[0]
-                dy = params[1] if len(params) > 1 else 0.0
-                t.translate(dx, dy)
-            elif op == 'scale':
-                sx = params[0]
-                sy = params[1] if len(params) > 1 else sx
-                t.scale(sx, sy)
-            elif op == 'rotate':
-                angle = params[0]
-                if len(params) == 3:
-                    cx, cy = params[1], params[2]
-                    t.translate(cx, cy)
-                    t.rotate(angle)
-                    t.translate(-cx, -cy)
-                else:
-                    t.rotate(angle)
-        return t
+    def _is_hidden(elem) -> bool:
+        values = getattr(elem, "values", {}) or {}
+        if str(values.get("visibility", "")).strip().lower() in ("hidden", "collapse"):
+            return True
+        if str(values.get("display", "")).strip().lower() == "none":
+            return True
+        try:
+            if float(values.get("opacity", 1.0)) <= 0.0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        return False
 
     @staticmethod
-    def extract_font_props(element: ET.Element, parent_props: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Wyciąga parametry tekstu z atrybutów XML oraz arkuszy stylów CSS."""
-        props = parent_props.copy() if parent_props else {
-            'family': 'Arial', 'size': 24.0, 'italic': False, 
-            'bold': False, 'anchor': 'start', 'color': None
-        }
-
-        style = element.attrib.get('style', '')
-
-        if 'font-family' in element.attrib:
-            props['family'] = element.attrib['font-family']
-        elif 'font-family:' in style:
-            m = re.search(r'font-family:\s*([^;]+)', style)
-            if m:
-                props['family'] = m.group(1).replace("'", "").replace('"', '').strip()
-
-        if 'font-size' in element.attrib:
-            m = re.search(r'[-+]?\d*\.?\d+', element.attrib['font-size'])
-            if m:
-                props['size'] = float(m.group(0))
-        elif 'font-size:' in style:
-            m = re.search(r'font-size:\s*([\d\.]+)px?', style)
-            if m:
-                props['size'] = float(m.group(1))
-
-        if element.attrib.get('font-style') in ('italic', 'oblique') or 'font-style:italic' in style:
-            props['italic'] = True
-        if element.attrib.get('font-weight') == 'bold' or 'font-weight:bold' in style:
-            props['bold'] = True
-
-        if 'text-anchor' in element.attrib:
-            props['anchor'] = element.attrib['text-anchor']
-        elif 'text-anchor:' in style:
-            m = re.search(r'text-anchor:\s*([^;]+)', style)
-            if m:
-                props['anchor'] = m.group(1).strip()
-
-        if 'fill' in element.attrib and element.attrib['fill'] not in ('none', ''):
-            props['color'] = element.attrib['fill']
-        elif 'fill:' in style:
-            m = re.search(r'fill:\s*([^;]+)', style)
-            if m and m.group(1) != 'none':
-                props['color'] = m.group(1).strip()
-
-        return props
-
-    def _convert_text_to_path(self, text: str, x: float, y: float, font_props: Dict[str, Any], transform: QTransform) -> QPainterPath:
-        """Renderuje glify czcionki bezpośrednio do obiektów wektorowych QPainterPath."""
-        qfont = QFont(font_props['family'])
-        qfont.setPointSizeF(font_props['size'] * 0.75)
-        qfont.setItalic(font_props['italic'])
-        qfont.setBold(font_props['bold'])
-
-        fm = QFontMetricsF(qfont)
-        text_w = fm.horizontalAdvance(text)
-
-        draw_x = x
-        if font_props['anchor'] == 'middle':
-            draw_x = x - (text_w / 2.0)
-        elif font_props['anchor'] == 'end':
-            draw_x = x - text_w
-
-        line_path = QPainterPath()
-        line_path.addText(QPointF(draw_x, y), qfont, text)
-        return transform.map(line_path)
-
-    def load_svg(self, file_path: str, default_pos: QPointF = QPointF(10.0, 10.0)) -> List[QGraphicsPathItem]:
-        """Główna metoda parsująca plik SVG z konwersją współrzędnych do układu maszyny CNC."""
-        items: List[QGraphicsPathItem] = []
-
-        # 1. Parsowanie elementów geometrycznych przez svgelements
+    def _stroke_visible(elem) -> bool:
+        width = getattr(elem, "stroke_width", None)
         try:
-            svg = svgelements.SVG.parse(file_path)
-            for elem in svg.elements():
-                if isinstance(elem, (svgelements.SVG, svgelements.Group)):
-                    continue
-                try:
-                    geom_path = svgelements.Path(elem)
-                except Exception:
-                    continue
+            return width is None or float(width) > 0.0
+        except (TypeError, ValueError):
+            return True
 
-                qpath = QPainterPath()
-                for seg in geom_path:
-                    if isinstance(seg, svgelements.Move):
-                        qpath.moveTo(seg.end.x, seg.end.y)
-                    elif isinstance(seg, svgelements.Line):
-                        qpath.lineTo(seg.end.x, seg.end.y)
-                    elif isinstance(seg, svgelements.Close):
-                        qpath.closeSubpath()
-                    elif isinstance(seg, svgelements.CubicBezier):
-                        qpath.cubicTo(seg.control1.x, seg.control1.y, seg.control2.x, seg.control2.y, seg.end.x, seg.end.y)
-                    elif isinstance(seg, svgelements.QuadraticBezier):
-                        qpath.quadTo(seg.control.x, seg.control.y, seg.end.x, seg.end.y)
-                    elif isinstance(seg, svgelements.Arc):
-                        for pt in seg.as_points():
-                            qpath.lineTo(pt.x, pt.y)
+    def _shape_color(self, elem) -> Optional[QColor]:
+        stroke = self._svg_color(getattr(elem, "stroke", None))
+        if stroke is not None and self._stroke_visible(elem):
+            return stroke
+        return self._svg_color(getattr(elem, "fill", None))
 
-                if not qpath.isEmpty():
-                    color_hex = None
-                    if isinstance(getattr(elem, 'stroke', None), svgelements.Color):
-                        color_hex = elem.stroke.hex
-                    elif isinstance(getattr(elem, 'fill', None), svgelements.Color):
-                        color_hex = elem.fill.hex
-                    
-                    items.append(self._create_item(qpath, color_hex))
-        except Exception as e:
-            print(f"[SvgDocumentImporter] Błąd svgelements: {e}")
+    def _text_color(self, elem) -> Optional[QColor]:
+        fill = self._svg_color(getattr(elem, "fill", None))
+        if fill is not None:
+            return fill
+        return self._svg_color(getattr(elem, "stroke", None))
 
-        # 2. Parsowanie tekstów z drzewa XML (Inkscape <text>, <tspan>)
+    # =========================================================================
+    # GEOMETRIA
+    # =========================================================================
+    @staticmethod
+    def _path_to_qpath(geom_path: svgelements.Path) -> QPainterPath:
+        """Ścieżka svgelements (już z zastosowanymi transformacjami) -> QPainterPath w px."""
+        qpath = QPainterPath()
+        for seg in geom_path:
+            if isinstance(seg, svgelements.Move):
+                if seg.end is not None:
+                    qpath.moveTo(seg.end.x, seg.end.y)
+            elif isinstance(seg, svgelements.Close):
+                qpath.closeSubpath()
+            elif isinstance(seg, svgelements.Line):
+                qpath.lineTo(seg.end.x, seg.end.y)
+            elif isinstance(seg, svgelements.CubicBezier):
+                qpath.cubicTo(seg.control1.x, seg.control1.y, seg.control2.x, seg.control2.y, seg.end.x, seg.end.y)
+            elif isinstance(seg, svgelements.QuadraticBezier):
+                qpath.quadTo(seg.control.x, seg.control.y, seg.end.x, seg.end.y)
+            elif isinstance(seg, svgelements.Arc):
+                # Łuk eliptyczny jako krzywe Béziera (dokładniej niż odcinki)
+                for cubic in seg.as_cubic_curves():
+                    qpath.cubicTo(cubic.control1.x, cubic.control1.y, cubic.control2.x, cubic.control2.y,
+                                  cubic.end.x, cubic.end.y)
+        return qpath
+
+    @staticmethod
+    def _matrix_to_qtransform(m) -> QTransform:
+        if m is None:
+            return QTransform()
+        return QTransform(float(m.a), float(m.b), float(m.c), float(m.d), float(m.e), float(m.f))
+
+    @staticmethod
+    def _first_font_family(family) -> str:
+        if not family:
+            return "Arial"
+        first = str(family).split(",")[0].strip().strip("'\"")
+        return first or "Arial"
+
+    def _text_to_qpath(self, elem) -> QPainterPath:
+        """Tekst SVG -> krzywe glifów, w tych samych jednostkach (px) co reszta geometrii."""
+        text = getattr(elem, "text", None)
+        if not text or not str(text).strip():
+            return QPainterPath()
+        text = str(text)
+
+        font_size = float(getattr(elem, "font_size", 16.0) or 16.0)
+        qfont = QFont(self._first_font_family(getattr(elem, "font_family", None)))
+        qfont.setPixelSize(_REF_FONT_PX)
+
+        weight = getattr(elem, "font_weight", None)
         try:
-            tree = ET.parse(file_path)
-            root = tree.getroot()
-            for elem in root.iter():
-                if '}' in elem.tag:
-                    elem.tag = elem.tag.split('}', 1)[1]
+            qfont.setBold(int(float(weight)) >= 600)
+        except (TypeError, ValueError):
+            qfont.setBold(str(weight).lower() in ("bold", "bolder"))
+        qfont.setItalic(str(getattr(elem, "font_style", "") or "").lower() in ("italic", "oblique"))
 
-            def parse_node(node: ET.Element, accum_transform: QTransform, inherited_font: Optional[Dict[str, Any]]):
-                node_trans = self.parse_transform(node.attrib.get('transform', ''))
-                curr_trans = node_trans * accum_transform
-                curr_font = self.extract_font_props(node, inherited_font)
+        glyphs = QPainterPath()
+        glyphs.addText(QPointF(0.0, 0.0), qfont, text)
 
-                if node.tag == 'text':
-                    bx = float(re.search(r'[-+]?\d*\.?\d+', node.attrib.get('x', '0')).group(0)) if node.attrib.get('x') else 0.0
-                    by = float(re.search(r'[-+]?\d*\.?\d+', node.attrib.get('y', '0')).group(0)) if node.attrib.get('y') else 0.0
+        anchor = str(getattr(elem, "anchor", "start") or "start").lower()
+        if anchor in ("middle", "end"):
+            advance = QFontMetricsF(qfont).horizontalAdvance(text)
+            shift = advance / 2.0 if anchor == "middle" else advance
+            glyphs = QTransform().translate(-shift, 0.0).map(glyphs)
 
-                    tspans = [c for c in node if c.tag == 'tspan']
-                    if tspans:
-                        cur_x, cur_y = bx, by
-                        for ts in tspans:
-                            t_font = self.extract_font_props(ts, curr_font)
-                            txt = "".join(ts.itertext()).strip()
-                            if not txt:
-                                continue
-                            if 'x' in ts.attrib:
-                                cur_x = float(re.search(r'[-+]?\d*\.?\d+', ts.attrib['x']).group(0))
-                            if 'y' in ts.attrib:
-                                cur_y = float(re.search(r'[-+]?\d*\.?\d+', ts.attrib['y']).group(0))
-                            elif 'dy' in ts.attrib:
-                                m_dy = re.search(r'[-+]?\d*\.?\d+', ts.attrib['dy'])
-                                cur_y += float(m_dy.group(0)) if m_dy else t_font['size'] * 1.2
+        scale = font_size / _REF_FONT_PX
+        x = float(getattr(elem, "x", 0.0) or 0.0)
+        y = float(getattr(elem, "y", 0.0) or 0.0)
+        local = QTransform(scale, 0.0, 0.0, scale, x, y)  # baseline w punkcie (x, y)
+        return (local * self._matrix_to_qtransform(getattr(elem, "transform", None))).map(glyphs)
 
-                            ts_trans = self.parse_transform(ts.attrib.get('transform', ''))
-                            qpath = self._convert_text_to_path(txt, cur_x, cur_y, t_font, ts_trans * curr_trans)
-                            if not qpath.isEmpty():
-                                items.append(self._create_item(qpath, t_font.get('color')))
-                    else:
-                        txt = "".join(node.itertext()).strip()
-                        if txt:
-                            qpath = self._convert_text_to_path(txt, bx, by, curr_font, curr_trans)
-                            if not qpath.isEmpty():
-                                items.append(self._create_item(qpath, curr_font.get('color')))
+    # =========================================================================
+    # GŁÓWNY IMPORT
+    # =========================================================================
+    def load_svg(
+        self,
+        file_path: str,
+        default_pos: Optional[QPointF] = None,
+        keep_document_position: bool = True
+    ) -> List[QGraphicsPathItem]:
+        """
+        Importuje plik SVG jako obiekty sceny w milimetrach stołu (oś Y w górę).
 
-                for child in node:
-                    if child.tag not in ('tspan', 'flowPara', 'flowRegion'):
-                        parse_node(child, curr_trans, curr_font)
+        keep_document_position=True: lewy dolny róg strony SVG trafia w X0 Y0 stołu, więc
+        obiekty zachowują swoje położenie z dokumentu (np. strony Inkscape).
+        keep_document_position=False: lewy dolny róg obwiedni importu trafia w default_pos.
+        """
+        report = SvgImportReport(file_path=file_path)
+        self.last_report = report
 
-            parse_node(root, QTransform(), None)
+        ppi, generator = self.detect_px_per_inch(file_path)
+        if self.px_per_inch_override:
+            ppi = float(self.px_per_inch_override)
+        report.px_per_inch = ppi
+        report.generator = generator
+
+        try:
+            svg = svgelements.SVG.parse(file_path, reify=True, ppi=CSS_PX_PER_INCH)
         except Exception as e:
-            print(f"[SvgDocumentImporter] Błąd XML text: {e}")
-
-        if not items:
+            report.errors.append(f"Nie można odczytać pliku: {e}")
             return []
 
-        # 3. Skalowanie fizyczne (96 DPI -> mm) oraz inwersja osi Y pod stół roboczy CNC
-        px_to_mm = 25.4 / 96.0
-        t_scale_flip = QTransform().scale(px_to_mm, -px_to_mm)
-        for item in items:
-            item.setPath(t_scale_flip.map(item.path()))
+        raw: List[Tuple[QPainterPath, Optional[QColor]]] = []
+        for elem in svg.elements():
+            if isinstance(elem, (svgelements.SVG, svgelements.Group, svgelements.Use)):
+                continue
+            if isinstance(elem, (svgelements.Image, getattr(svgelements, "SVGImage", svgelements.Image))):
+                report.skipped_images += 1
+                continue
+            if self._is_hidden(elem):
+                report.skipped_hidden += 1
+                continue
 
-        # Obliczenie wspólnej obwiedni całego pliku w milimetrach
-        full_path_mm = QPainterPath()
-        for item in items:
-            full_path_mm.addPath(item.path())
-        bbox_mm = full_path_mm.boundingRect()
+            try:
+                if isinstance(elem, svgelements.Text):
+                    if not getattr(elem, "text", None):
+                        continue  # kontener <text> z <tspan> – treść przychodzi w osobnych elementach
+                    qpath = self._text_to_qpath(elem)
+                    color = self._text_color(elem)
+                    is_text = True
+                elif isinstance(elem, svgelements.Shape):
+                    color = self._shape_color(elem)
+                    if color is None:
+                        report.skipped_invisible += 1  # ani obrysu, ani wypełnienia
+                        continue
+                    qpath = self._path_to_qpath(svgelements.Path(elem))
+                    is_text = False
+                else:
+                    continue
+            except Exception as e:
+                report.errors.append(f"{type(elem).__name__} id={getattr(elem, 'id', None)}: {e}")
+                continue
 
-        # Przesunięcie do punktu docelowego stołu
-        dx = default_pos.x() - bbox_mm.left()
-        dy = default_pos.y() - bbox_mm.top()
+            if qpath.isEmpty() or qpath.elementCount() < 2:
+                report.skipped_empty += 1
+                continue
+            raw.append((qpath, color))
+            if is_text:
+                report.texts += 1
 
-        t_translate = QTransform().translate(dx, dy)
-        for item in items:
-            item.setPath(t_translate.map(item.path()))
+        if not raw:
+            return []
 
+        # Px (96 DPI svgelements) -> mm, z korektą dla dokumentów 72 DPI (Illustrator)
+        k = (MM_PER_INCH / CSS_PX_PER_INCH) * (CSS_PX_PER_INCH / ppi)
+
+        page_w_px, page_h_px = self._page_size_px(svg, raw)
+        page_h_mm = page_h_px * k
+        report.page_size_mm = (page_w_px * k, page_h_mm)
+
+        # SVG: Y w dół od góry strony. Stół: Y w górę od dołu -> y' = H - y
+        to_bed = QTransform(k, 0.0, 0.0, -k, 0.0, page_h_mm)
+        paths_mm = [(to_bed.map(p), c) for p, c in raw]
+
+        if not keep_document_position:
+            target = default_pos if default_pos is not None else QPointF(10.0, 10.0)
+            union = QPainterPath()
+            for p, _ in paths_mm:
+                union.addPath(p)
+            bbox = union.boundingRect()
+            shift = QTransform().translate(target.x() - bbox.left(), target.y() - bbox.top())
+            paths_mm = [(shift.map(p), c) for p, c in paths_mm]
+
+        items = [self._create_item(p, c) for p, c in paths_mm]
+        report.imported = len(items)
         return items
 
-    def _create_item(self, path: QPainterPath, stroke_color: Optional[str] = None) -> QGraphicsPathItem:
+    @staticmethod
+    def _page_size_px(svg: svgelements.SVG, raw: List[Tuple[QPainterPath, Optional[QColor]]]) -> Tuple[float, float]:
+        """Rozmiar strony w px: width/height, następnie viewBox, a na końcu obwiednia rysunku."""
+        w = float(getattr(svg, "width", 0.0) or 0.0)
+        h = float(getattr(svg, "height", 0.0) or 0.0)
+        if w > 1.0 and h > 1.0:
+            return w, h
+        vb = getattr(svg, "viewbox", None)
+        if vb is not None and getattr(vb, "height", None):
+            return float(vb.width), float(vb.height)
+        union = QPainterPath()
+        for p, _ in raw:
+            union.addPath(p)
+        rect = union.boundingRect()
+        return max(0.0, rect.right()), max(0.0, rect.bottom())
+
+    def _create_item(self, path: QPainterPath, color: Optional[QColor] = None) -> QGraphicsPathItem:
         item = QGraphicsPathItem(path)
-        col = QColor(stroke_color) if stroke_color and QColor(stroke_color).isValid() else self.pen.color()
+        col = QColor(color) if color is not None and color.isValid() else QColor(self.pen.color())
         pen = QPen(col, 1.2)
         pen.setCosmetic(True)
         item.setPen(pen)

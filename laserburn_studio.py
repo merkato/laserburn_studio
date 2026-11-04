@@ -40,7 +40,7 @@ from gcode_visualizer import GCodeVisualizerDialog
 from jog_panel import JogPanelWidget
 from rulers import CanvasWithRulers
 from path_optimizer import PathOptimizer
-from project_manager import ProjectSerializer
+from project_manager import ProjectSerializer, ProjectFormatError
 from time_estimator import CycleTimeEstimator
 from material_tester import MaterialTestDialog
 
@@ -2192,20 +2192,29 @@ class LaserBurnStudio(QMainWindow):
         if not path:
             return
 
-        pos = QPointF(10.0, 10.0)
-        if hasattr(self, "shapely_material_poly") and self.shapely_material_poly:
-            c = self.shapely_material_poly.centroid
-            pos = QPointF(float(c.x), float(c.y))
+        # Obiekty zachowują położenie ze strony SVG (lewy dolny róg strony = X0 Y0 stołu)
+        default_color = self.layers[0].color if self.layers else QColor("#000000")
+        importer = SvgDocumentImporter(default_pen=QPen(default_color, 1.0))
+        items = importer.load_svg(path, keep_document_position=True)
+        report = importer.last_report
 
-        importer = SvgDocumentImporter(default_pen=QPen(self.layers[0].color, 1.0))
-        items = importer.load_svg(path, default_pos=pos)
+        if not items:
+            detail = "\n".join(report.errors[:5]) or "Plik nie zawiera widocznej geometrii wektorowej."
+            QMessageBox.warning(self, "Import SVG", f"Nie zaimportowano żadnych obiektów.\n\n{detail}")
+            return
 
         self.scene.clearSelection()
         for item in items:
             self.scene.addItem(item)
             item.setSelected(True)
 
-        self.status.showMessage(f"Zaimportowano SVG: {path} (obiektów: {len(items)})")
+        # Kolory bez odpowiadającej warstwy trafią do warstwy domyślnej – informujemy o tym
+        layer_colors = {QColor(l.color).name() for l in self.layers}
+        unmatched = sorted({it.pen().color().name() for it in items} - layer_colors)
+        msg = f"Zaimportowano SVG ({report.summary()})"
+        if unmatched:
+            msg += f" | kolory bez warstwy: {', '.join(unmatched[:6])}" + ("…" if len(unmatched) > 6 else "")
+        self.status.showMessage(msg, 8000)
 
     def _import_raster(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2357,9 +2366,7 @@ class LaserBurnStudio(QMainWindow):
             return
 
         try:
-            data = ProjectSerializer.serialize(self)
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            ProjectSerializer.save_to_file(self, file_path)
             self.status.showMessage(f"Projekt pomyślnie zapisany: {file_path}", 5000)
         except Exception as e:
             QMessageBox.critical(self, "Błąd zapisu", f"Nie udało się zapisać projektu:\n{e}")
@@ -2372,15 +2379,12 @@ class LaserBurnStudio(QMainWindow):
             return
 
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-
-            if data.get("format") not in ("LaserCAM_Project", "LaserBurn_Project"):
-                QMessageBox.warning(self, "Błąd formatu", "Wybrany plik nie jest poprawnym projektem LaserBurn Studio.")
-                return
-
-            ProjectSerializer.deserialize(self, data)
+            warnings = ProjectSerializer.load_from_file(self, file_path)
             self.status.showMessage(f"Projekt wczytany: {file_path}", 5000)
+            if warnings:
+                QMessageBox.warning(self, "Projekt wczytany z uwagami", "\n".join(warnings[:15]))
+        except ProjectFormatError as e:
+            QMessageBox.warning(self, "Błąd formatu", str(e))
         except Exception as e:
             QMessageBox.critical(self, "Błąd odczytu", f"Nie udało się wczytać projektu:\n{e}")
    
