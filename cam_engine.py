@@ -28,7 +28,7 @@ class GCodePostProcessor:
     """
     def __init__(self, laser_mode: str = "M4", s_max: int = 1000):
         self.laser_mode = laser_mode
-        self.s_max = s_max
+        self.s_max = s_max  # Odpowiednik parametru $30 w GRBL (np. 1000 lub 255)
         self.reset_state()
 
     # =========================================================================
@@ -138,34 +138,46 @@ class GCodePostProcessor:
         paths: List[List[Tuple[float, float]]], 
         feed: float, 
         power_pct: float, 
-        passes: int = 1
+        passes: int = 1,
+        optimize_order: bool = True,
+        start_head_pos: Tuple[float, float] = (0.0, 0.0)
     ) -> List[str]:
         """
         Generuje kod dla graweru/cięcia wektorowego po obrysie (Line).
         paths: Lista ciągów punktów [(x, y), ...] w milimetrach stołu.
+        optimize_order: scalanie segmentów + kolejność Inside-Out + redukcja G0 (PathOptimizer.optimize).
         """
         lines = []
-        s_val = int(round((power_pct / 100.0) * self.s_max))
+        s_val = self.power_pct_to_s(power_pct)
+
+        if optimize_order:
+            valid = [LineString(p) for p in paths if len(p) >= 2]
+            processed_paths = PathOptimizer.optimize(valid, start_head_pos=start_head_pos)
+        else:
+            processed_paths = paths
 
         for p_idx in range(1, passes + 1):
             lines.append(f"; --- Przejście {p_idx}/{passes} ---")
-            for subpath in paths:
+            for subpath in processed_paths:
                 if len(subpath) < 2:
                     continue
 
                 start_pt = subpath[0]
-                # Ruch jałowy z wyłączoną wiązką
+                # Ruch jałowy wyłącznie przy zgaszonej wiązce
+                lines.append("M5")
                 lines.append(f"G0 X{start_pt[0]:.3f} Y{start_pt[1]:.3f}")
-                
-                # Pierwszy ruch roboczy ustala posuw F i moc S
+
+                # Włącz dynamiczną moc tuż przed ruchem roboczym; pierwszy G1 ustala posuw F
+                lines.append(f"M4 S{s_val}")
                 p1 = subpath[1]
-                lines.append(f"G1 X{p1[0]:.3f} Y{p1[1]:.3f} F{feed:.1f} S{s_val}")
+                lines.append(f"G1 X{p1[0]:.3f} Y{p1[1]:.3f} F{feed:.1f}")
 
                 # Kolejne punkty (modalne G1, F i S)
                 for pt in subpath[2:]:
                     lines.append(f"G1 X{pt[0]:.3f} Y{pt[1]:.3f}")
 
-            lines.append("M5 S0 ; Wyłączenie na nawrocie")
+                # Zgaś wiązkę po każdym konturze
+                lines.append("M5")
 
         return lines
 
@@ -228,46 +240,13 @@ class GCodePostProcessor:
         reverse = False
         for seg in hatch_segments:
             pts = seg[::-1] if reverse else seg
+            # Ruch jałowy wyłącznie przy zgaszonej wiązce
+            lines.append("M5")
             lines.append(f"G0 X{pts[0][0]:.3f} Y{pts[0][1]:.3f}")
-            lines.append(f"G1 X{pts[1][0]:.3f} Y{pts[1][1]:.3f} F{feed:.1f} S{s_val}")
-            lines.append("M5 S0")
+            lines.append(f"M4 S{s_val}")
+            lines.append(f"G1 X{pts[1][0]:.3f} Y{pts[1][1]:.3f} F{feed:.1f}")
             reverse = not reverse
-
-        return lines
-
-    def generate_line_paths(
-        self, 
-        paths: List[List[Tuple[float, float]]], 
-        feed: float, 
-        power_pct: float, 
-        passes: int = 1,
-        optimize_order: bool = True
-    ) -> List[str]:
-        lines = []
-        s_val = int(round((power_pct / 100.0) * self.s_max))
-
-        # Optymalizacja kolejności cięcia: Inside-Out + redukcja G0
-        if optimize_order:
-            processed_paths = PathOptimizer.optimize_layer(paths, start_machine_pos=(0.0, 0.0))
-        else:
-            processed_paths = paths
-
-        for p_idx in range(1, passes + 1):
-            lines.append(f"; --- Przejście {p_idx}/{passes} ---")
-            for subpath in processed_paths:
-                if len(subpath) < 2:
-                    continue
-
-                start_pt = subpath[0]
-                lines.append(f"G0 X{start_pt[0]:.3f} Y{start_pt[1]:.3f}")
-                
-                p1 = subpath[1]
-                lines.append(f"G1 X{p1[0]:.3f} Y{p1[1]:.3f} F{feed:.1f} S{s_val}")
-
-                for pt in subpath[2:]:
-                    lines.append(f"G1 X{pt[0]:.3f} Y{pt[1]:.3f}")
-
-            lines.append("M5 S0 ; Wyłączenie na nawrocie")
+        lines.append("M5")
 
         return lines
     # =========================================================================
