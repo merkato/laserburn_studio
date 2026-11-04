@@ -38,6 +38,8 @@ from raster_engine import RasterImageProcessor
 from cam_engine import GCodePostProcessor, ToolPath
 from gcode_visualizer import GCodeVisualizerDialog
 from jog_panel import JogPanelWidget
+from bridge_client import BridgeClient
+from material_fitting import MaterialFittingOptimizer
 from rulers import CanvasWithRulers
 from path_optimizer import PathOptimizer
 from project_manager import ProjectSerializer, ProjectFormatError
@@ -687,57 +689,6 @@ class LaserCrosshairItem(QGraphicsItem):
         painter.drawEllipse(QPointF(0, 0), 2.0, 2.0)
 
 
-class GCodeUploadWorker(QThread):
-    finished_signal = Signal(bool, str)
-
-    def __init__(self, host_url: str, gcode_content: str, filename: str = "job.nc", parent=None):
-        super().__init__(parent)
-        clean_host = host_url.replace("ws://", "http://").replace("wss://", "https://")
-        if clean_host.endswith("/ws"):
-            clean_host = clean_host[:-3]
-        self.target_url = f"{clean_host}/api/files/local"
-        self.gcode_content = gcode_content
-        self.filename = filename
-
-    def run(self):
-        try:
-            boundary = "----LaserCAMBoundaryWebKitFormBoundary"
-            body = io.BytesIO()
-
-            body.write(f"--{boundary}\r\n".encode("utf-8"))
-            body.write(b'Content-Disposition: form-data; name="print"\r\n\r\n')
-            body.write(b"true\r\n")
-
-            body.write(f"--{boundary}\r\n".encode("utf-8"))
-            body.write(
-                f'Content-Disposition: form-data; name="file"; filename="{self.filename}"\r\n'.encode("utf-8")
-            )
-            body.write(b"Content-Type: text/plain\r\n\r\n")
-            body.write(self.gcode_content.encode("utf-8"))
-            body.write(b"\r\n")
-            body.write(f"--{boundary}--\r\n".encode("utf-8"))
-
-            payload = body.getvalue()
-
-            req = urllib.request.Request(
-                self.target_url,
-                data=payload,
-                headers={
-                    "Content-Type": f"multipart/form-data; boundary={boundary}",
-                    "Content-Length": str(len(payload)),
-                },
-                method="POST",
-            )
-
-            with urllib.request.urlopen(req, timeout=15) as response:
-                if response.status in (200, 201):
-                    self.finished_signal.emit(True, "Zadanie wysłane. Rozpoczęto wypalanie!")
-                else:
-                    self.finished_signal.emit(False, f"Serwer zwrócił kod {response.status}")
-        except Exception as e:
-            self.finished_signal.emit(False, f"Błąd transmisji: {e}")
-
-
 # ==============================================================================
 # GŁÓWNE OKNO APLIKACJI — LASERBURN STUDIO
 # ==============================================================================
@@ -780,14 +731,16 @@ class LaserBurnStudio(QMainWindow):
         self.crosshair.setVisible(False)
         self.scene.addItem(self.crosshair)
 
-        self.ws_client = QWebSocket()
+        # Jedno połączenie z mostkiem grbl-bridge (telemetria, komendy, sterowanie zadaniem)
+        self.bridge = BridgeClient(self)
         if hasattr(self, "jog_widget") and self.jog_widget:
-            self.jog_widget.set_ws_client(self.ws_client)
+            self.jog_widget.set_bridge(self.bridge)
 
-        self.ws_client.connected.connect(self._on_ws_connected)
-        self.ws_client.disconnected.connect(self._on_ws_disconnected)
-        self.ws_client.textMessageReceived.connect(self._on_ws_message)
-        self.ws_client.errorOccurred.connect(self._on_ws_error)
+        self.bridge.connected.connect(self._on_ws_connected)
+        self.bridge.disconnected.connect(self._on_ws_disconnected)
+        self.bridge.state_changed.connect(self._on_bridge_state)
+        self.bridge.error.connect(self._on_ws_error)
+        self.bridge.notice.connect(lambda msg: self.status.showMessage(msg, 8000))
 
         self.estimator = CycleTimeEstimator(default_rapid_f=6000.0, accel_mm_s2=500.0)
         self.estimated_total_time_s = 0.0
@@ -1696,11 +1649,11 @@ class LaserBurnStudio(QMainWindow):
     # =========================================================================
 
     def emergency_stop(self):
-        if self.ws_client and self.ws_client.isValid():
-            self.ws_client.sendTextMessage("!")
-            self.ws_client.sendTextMessage("M5")
-            self.ws_client.sendTextMessage("\x85")
-        self.status.showMessage("⚠️ AWARYJNE ZATRZYMANIE (FEED HOLD + LASER OFF)!", 8000)
+        """STOP: feed hold i – po zatrzymaniu – soft-reset czyszczący bufor GRBL (bez utraty pozycji)."""
+        if hasattr(self, "jog_widget") and self.jog_widget and self.jog_widget.btn_focus.isChecked():
+            self.jog_widget.btn_focus.setChecked(False)
+        if self.bridge.cancel():
+            self.status.showMessage("STOP: zatrzymywanie i czyszczenie bufora maszyny…", 8000)
 
     def _create_new_layer(self):
         palette_fallbacks = [
@@ -1955,16 +1908,16 @@ class LaserBurnStudio(QMainWindow):
             self.status.showMessage(f"Pozycja maszyny WPos: X={x:.2f} mm | Y={y:.2f} mm", 2000)
 
     def _toggle_ws_connection(self):
-        if self.ws_client.state() == QAbstractSocket.SocketState.ConnectedState:
+        if self.bridge.is_connected():
             print("[WS] Rozłączanie...")
-            self.ws_client.close()
+            self.bridge.close()
         else:
             ws_url = "ws://malina.local:8000/ws"
             if hasattr(self, "input_ws_url") and self.input_ws_url.text().strip():
                 ws_url = self.input_ws_url.text().strip()
 
             print(f"[WS] Łączenie z: {ws_url}")
-            self.ws_client.open(QUrl(ws_url))
+            self.bridge.open(ws_url)
 
     def _on_ws_connected(self):
         print("[WS] Połączono z mostkiem GRBL.")
@@ -1994,11 +1947,7 @@ class LaserBurnStudio(QMainWindow):
         """)
         self.status.showMessage("Rozłączono z GRBL Bridge", 4000)
 
-    def _on_ws_message(self, message: str):
-        try:
-            data = json.loads(message)
-        except Exception:
-            return
+    def _on_bridge_state(self, data: dict):
 
         wx = float(data.get("wpos_x", 0.0))
         wy = float(data.get("wpos_y", 0.0))
@@ -2029,10 +1978,9 @@ class LaserBurnStudio(QMainWindow):
             elif progress == 100.0:
                 self.progress_bar.setValue(100)
 
-    def _on_ws_error(self, error_code):
-        err_str = self.ws_client.errorString()
-        print(f"[WS ERROR] Kod: {error_code}, Treść: {err_str}")
-        self.status.showMessage(f"Błąd WS: {err_str}", 5000)
+    def _on_ws_error(self, err_str: str):
+        print(f"[MOSTEK] {err_str}")
+        self.status.showMessage(f"Mostek: {err_str}", 6000)
 
     def _on_record_boundary_point(self):
         if hasattr(self, "crosshair") and self.crosshair:
@@ -2142,11 +2090,13 @@ class LaserBurnStudio(QMainWindow):
                 self.status.showMessage("Najpierw wyznacz obrys plastra drewna!", 4000)
             return
 
+        helpers = {self.boundary_item, self.centroid_item, self.crosshair, self.transform_box,
+                   self.guides, getattr(self, "laser_reticle", None)}
         selected_items = self._get_user_selected_items()
         target_items = selected_items if selected_items else [
             it for it in self.scene.items()
-            if it not in (self.boundary_item, self.centroid_item, self.crosshair, self.transform_box, self.guides) 
-            and it.zValue() >= 10
+            if it not in helpers and it.zValue() >= 10 and it.isVisible() and it.parentItem() is None
+            and isinstance(it, (QGraphicsPathItem, QGraphicsPixmapItem))
         ]
 
         if not target_items:
@@ -2154,42 +2104,26 @@ class LaserBurnStudio(QMainWindow):
                 self.status.showMessage("Brak elementów graficznych do dopasowania!", 3000)
             return
 
-        group_rect = QRectF()
-        for it in target_items:
-            group_rect = group_rect.united(it.sceneBoundingRect())
-
-        cur_w = group_rect.width()
-        cur_h = group_rect.height()
-
-        if cur_w <= 0.01 or cur_h <= 0.01:
+        # Cała grupa naraz (zachowane położenia względne), tylko zmniejszanie,
+        # obrót tylko gdy projekt nie mieści się w pełnym rozmiarze.
+        result = MaterialFittingOptimizer.fit_items(
+            target_items, self.shapely_material_poly, margin_mm=margin_mm,
+            allow_rotation=True, angle_step_deg=5.0, max_scale=1.0
+        )
+        if result is None:
+            if hasattr(self, "status"):
+                self.status.showMessage("Projekt nie mieści się w obrysie plastra (sprawdź margines).", 5000)
             return
 
-        safe_poly = self.shapely_material_poly.buffer(-margin_mm)
-        if safe_poly.is_empty:
-            safe_poly = self.shapely_material_poly
-
-        min_x, min_y, max_x, max_y = safe_poly.bounds
-        safe_w = max_x - min_x
-        safe_h = max_y - min_y
-
-        scale_factor = min(safe_w / cur_w, safe_h / cur_h, 1.0) if (cur_w > safe_w or cur_h > safe_h) else 1.0
-
-        c = safe_poly.centroid if not safe_poly.is_empty else self.shapely_material_poly.centroid
-        target_cx, target_cy = float(c.x), float(c.y)
-
-        orig_cx = group_rect.center().x()
-        orig_cy = group_rect.center().y()
-
-        for it in target_items:
-            it.moveBy(target_cx - orig_cx, target_cy - orig_cy)
-            if scale_factor < 0.999:
-                t = QTransform()
-                t.scale(scale_factor, scale_factor)
-                it.setTransform(it.transform() * t)
+        MaterialFittingOptimizer.apply(target_items, result)
+        if hasattr(self, "transform_box"):
+            self.transform_box.update_geometry()
 
         if hasattr(self, "status"):
-            msg = f"Dopasowano do plastra: margines {margin_mm:.1f} mm, skala: {scale_factor * 100:.1f}%"
-            self.status.showMessage(msg, 4000)
+            msg = f"Dopasowano do plastra: margines {margin_mm:.1f} mm, skala {result.scale * 100:.1f}%"
+            if abs(result.angle_deg) > 1e-6:
+                msg += f", obrót {result.angle_deg:.0f}°"
+            self.status.showMessage(msg, 5000)
 
     def _import_svg(self):
         path, _ = QFileDialog.getOpenFileName(self, "Wybierz plik SVG", "", "Pliki wektorowe (*.svg)")
@@ -2256,7 +2190,7 @@ class LaserBurnStudio(QMainWindow):
                 self.status.showMessage(f"Błąd importu: {e}", 4000)
 
     def frame_project(self):
-        if not self.ws_client.isValid():
+        if not self.bridge.is_connected():
             self.status.showMessage("Brak połączenia z maszyną! Wciśnij F2 lub kliknij ⚡.", 4000)
             return
 
@@ -2296,14 +2230,15 @@ class LaserBurnStudio(QMainWindow):
             "M5"
         ]
 
-        self.ws_client.sendTextMessage("\n".join(framing_gcode))
+        if not self.bridge.send_gcode("\n".join(framing_gcode)):
+            return
         self.status.showMessage(
             f"⛶ Framing: X[{min_x:.1f}..{max_x:.1f}] Y[{min_y:.1f}..{max_y:.1f}] | Wymiary: {width_mm:.1f} x {height_mm:.1f} mm",
             6000
         )
 
     def start_job_on_device(self):
-        if not self.ws_client.isValid():
+        if not self.bridge.is_connected():
             self.status.showMessage("Najpierw połącz się z Raspberry Pi (F2)!", 4000)
             return
 
@@ -2330,16 +2265,12 @@ class LaserBurnStudio(QMainWindow):
         self.progress_bar.setValue(0)
         self.job_timer.restart()
 
-        host = self.input_ws_url.text().strip()
-        
-        # 1. Jeśli istnieje stary obiekt poprzedniego zadania, spokojnie poczekaj aż zamknie porty
-        if hasattr(self, "upload_worker") and self.upload_worker is not None:
-            self.upload_worker.wait()
-            
-        # 2. Przekazujemy "parent=self", co chroni obiekt przed przedwczesnym zniszczeniem (Crash Ochrony Pamięci)
-        self.upload_worker = GCodeUploadWorker(host, gcode_text, filename="lasercam_job.nc", parent=self)
-        self.upload_worker.finished_signal.connect(self._on_upload_finished)
-        self.upload_worker.start()
+        state = self.bridge.state or {}
+        if state.get("job_state") in ("running", "paused", "cancelling"):
+            self._on_upload_finished(False, "Na maszynie trwa zadanie – najpierw je zakończ lub anuluj (STOP).")
+            return
+        if not self.bridge.upload_job(gcode_text, self._on_upload_finished, filename="laserburn_job.nc"):
+            self._on_upload_finished(False, "Nie udało się rozpocząć wysyłania zadania.")
 
     def _on_upload_finished(self, success: bool, message: str):
         if hasattr(self, "btn_tb_start"):

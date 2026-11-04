@@ -1,313 +1,283 @@
 from __future__ import annotations
-from typing import Optional
-from PySide6.QtCore import Qt, Signal
+from typing import Optional, Dict, Any, List
+
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton,
-    QLabel, QDoubleSpinBox, QButtonGroup
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QPushButton, QLabel, QButtonGroup
 )
-from PySide6.QtWebSockets import QWebSocket
+
+from bridge_client import BridgeClient
+
+
+# ==============================================================================
+# STYLE (jedno miejsce)
+# ==============================================================================
+_BASE = "QPushButton {{ {body} }} QPushButton:hover:enabled {{ {hover} }} " \
+        "QPushButton:pressed {{ {pressed} }} QPushButton:disabled {{ background-color: #24242a; color: #5a5a62; border-color: #303036; }}"
+
+
+def _style(bg: str, fg: str = "#ffffff", border: str = "#3c3c44", hover: str = "", pressed: str = "#0078d4",
+           extra: str = "", checked: str = "") -> str:
+    body = f"background-color: {bg}; color: {fg}; border: 1px solid {border}; border-radius: 5px; padding: 6px; font-weight: bold; {extra}"
+    css = _BASE.format(body=body, hover=f"background-color: {hover or bg};", pressed=f"background-color: {pressed};")
+    if checked:
+        css += f" QPushButton:checked {{ {checked} }}"
+    return css
+
+
+STYLE_STEP = _style("#2b2b30", "#dcdcdc", hover="#383840",
+                    checked="background-color: #d83b01; border-color: #d83b01; color: white;")
+STYLE_JOG = _style("#2e323e", border="#444a5a", hover="#3b4050", extra="padding: 10px; font-size: 13px;")
+STYLE_HOME = _style("#1f222a", "#00a4ef", hover="#2b2b32", extra="font-size: 11px;")
+STYLE_ZERO = _style("#0e4f7a", border="#1a6294", hover="#116296", pressed="#093756", extra="font-size: 11px;")
+STYLE_ACTION = _style("#3a3a42", "#f0f0f0", border="#4e4e58", hover="#484852", extra="font-weight: normal;")
+STYLE_FOCUS = _style("#2b2b30", "#e0e0e0", hover="#383840",
+                     checked="background-color: #107c41; border-color: #107c41; color: white;")
+STYLE_PAUSE = _style("#8a5a00", border="#b07700", hover="#a86e00", pressed="#5c3c00")
+STYLE_RESUME = _style("#0e7a3d", border="#13a052", hover="#109148", pressed="#095228")
+STYLE_STOP = _style("#8b0000", border="#d13438", hover="#b30000", pressed="#500000", extra="padding: 9px;")
+
+_STATUS_COLORS = {
+    "Idle": "#0e7a3d", "Run": "#d97706", "Jog": "#d97706", "Hold": "#b91c1c",
+    "Door": "#b91c1c", "Alarm": "#7f1d1d", "Home": "#1d4ed8",
+}
 
 
 class JogPanelWidget(QWidget):
     """
-    Panel ręcznego sterowania osiami (JOG) kompatybilny z GRBL 1.1 ($J=...).
-    Odwzorowuje funkcjonalność mobilnego WebUI.
+    Ręczne sterowanie GRBL 1.1 ($J=...) oraz sterowanie zadaniem na mostku:
+    Pauza (feed hold), Wznów (cycle start), STOP = anuluj i wyczyść bufor GRBL.
+    Przyciski są aktywne tylko w stanach, w których dana akcja jest bezpieczna.
     """
-    # Sygnały dla głównego okna (jeśli potrzebna dodatkowa reakcja UI)
     command_sent = Signal(str)
 
-    def __init__(self, ws_client: Optional[QWebSocket] = None, parent: Optional[QWidget] = None):
+    STEPS = (0.1, 1.0, 10.0, 50.0)
+
+    def __init__(self, bridge: Optional[BridgeClient] = None, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.ws_client = ws_client
+        self.bridge: Optional[BridgeClient] = None
         self.current_step: float = 10.0
-        self.laser_focus_active: bool = False
-
+        self._motion_buttons: List[QPushButton] = []   # wymagają maszyny w spoczynku
         self._setup_ui()
+        self.set_bridge(bridge)
 
-    def set_ws_client(self, ws: QWebSocket):
-        """Umożliwia podpięcie lub zmianę klienta WebSocket."""
-        self.ws_client = ws
+    # ------------------------------------------------------------------ podłączenie
+    def set_bridge(self, bridge: Optional[BridgeClient]):
+        if self.bridge is bridge:
+            return
+        if self.bridge is not None:
+            for sig, slot in ((self.bridge.state_changed, self.update_state),
+                              (self.bridge.disconnected, self._on_disconnected)):
+                try:
+                    sig.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
+        self.bridge = bridge
+        if bridge is not None:
+            bridge.state_changed.connect(self.update_state)
+            bridge.disconnected.connect(self._on_disconnected)
+        self.update_state(bridge.state if bridge and bridge.is_connected() else None)
+
+    # ------------------------------------------------------------------ UI
+    def _section_label(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet("color: #aaa; font-weight: 500;")
+        return lbl
+
+    def _button(self, text: str, style: str, slot=None, motion: bool = False, tooltip: str = "") -> QPushButton:
+        btn = QPushButton(text)
+        btn.setStyleSheet(style)
+        if tooltip:
+            btn.setToolTip(tooltip)
+        if slot is not None:
+            btn.clicked.connect(slot)
+        if motion:
+            self._motion_buttons.append(btn)
+        return btn
 
     def _setup_ui(self):
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(4, 4, 4, 4)
-        main_layout.setSpacing(8)
+        main = QVBoxLayout(self)
+        main.setContentsMargins(4, 4, 4, 4)
+        main.setSpacing(8)
 
-        # -------------------------------------------------------------
-        # 1. WYBÓR KROKU (0.1 mm, 1 mm, 10 mm, 50 mm)
-        # -------------------------------------------------------------
-        step_label = QLabel("Krok przesuwu:")
-        step_label.setStyleSheet("color: #aaa; font-weight: 500;")
-        main_layout.addWidget(step_label)
+        # Stan maszyny i zadania
+        self.lbl_state = QLabel("Rozłączony")
+        self.lbl_state.setWordWrap(True)
+        main.addWidget(self.lbl_state)
 
-        h_step_layout = QHBoxLayout()
-        h_step_layout.setSpacing(4)
+        # 1. Krok
+        main.addWidget(self._section_label("Krok przesuwu:"))
+        h_step = QHBoxLayout()
+        h_step.setSpacing(4)
         self.btn_group_step = QButtonGroup(self)
         self.btn_group_step.setExclusive(True)
-
-        steps = [0.1, 1.0, 10.0, 50.0]
-        for val in steps:
-            txt = f"{val:g} mm"
-            btn = QPushButton(txt)
+        for val in self.STEPS:
+            btn = QPushButton(f"{val:g} mm")
             btn.setCheckable(True)
-            btn.setStyleSheet("""
-                QPushButton {
-                    background-color: #2b2b30;
-                    color: #dcdcdc;
-                    border: 1px solid #3c3c44;
-                    border-radius: 4px;
-                    padding: 5px;
-                    font-weight: bold;
-                }
-                QPushButton:checked {
-                    background-color: #d83b01;
-                    border-color: #d83b01;
-                    color: white;
-                }
-                QPushButton:hover:!checked {
-                    background-color: #383840;
-                }
-            """)
-            if val == self.current_step:
-                btn.setChecked(True)
-
-            btn.clicked.connect(lambda checked=False, v=val: self._set_step(v))
+            btn.setStyleSheet(STYLE_STEP)
+            btn.setChecked(val == self.current_step)
+            btn.clicked.connect(lambda _=False, v=val: self._set_step(v))
             self.btn_group_step.addButton(btn)
-            h_step_layout.addWidget(btn)
+            h_step.addWidget(btn)
+        main.addLayout(h_step)
 
-        main_layout.addLayout(h_step_layout)
-
-        # -------------------------------------------------------------
-        # 2. MANIPULATOR OSI XY ORAZ Z
-        # -------------------------------------------------------------
-        h_jog_axes = QHBoxLayout()
-        h_jog_axes.setSpacing(10)
-
-        # Siatka XY (3x3)
+        # 2. XY i Z
+        h_axes = QHBoxLayout()
+        h_axes.setSpacing(10)
         grid_xy = QGridLayout()
         grid_xy.setSpacing(4)
+        grid_xy.addWidget(self._button("▲ Y+", STYLE_JOG, lambda: self._send_jog(0, self.current_step, 0), True), 0, 1)
+        grid_xy.addWidget(self._button("◀ X-", STYLE_JOG, lambda: self._send_jog(-self.current_step, 0, 0), True), 1, 0)
+        grid_xy.addWidget(self._button("XY 0", STYLE_HOME, lambda: self.send_gcode("G90 G0 X0 Y0 F4000"), True,
+                                       "Szybki przejazd do X0 Y0 układu roboczego"), 1, 1)
+        grid_xy.addWidget(self._button("▶ X+", STYLE_JOG, lambda: self._send_jog(self.current_step, 0, 0), True), 1, 2)
+        grid_xy.addWidget(self._button("▼ Y-", STYLE_JOG, lambda: self._send_jog(0, -self.current_step, 0), True), 2, 1)
+        h_axes.addLayout(grid_xy, stretch=3)
 
-        btn_style_jog = """
-            QPushButton {
-                background-color: #2e323e;
-                color: #ffffff;
-                border: 1px solid #444a5a;
-                border-radius: 6px;
-                padding: 10px;
-                font-weight: bold;
-                font-size: 13px;
-            }
-            QPushButton:hover {
-                background-color: #3b4050;
-            }
-            QPushButton:pressed {
-                background-color: #0078d4;
-                color: #ffffff;
-            }
-        """
+        v_z = QVBoxLayout()
+        v_z.setSpacing(4)
+        v_z.addWidget(self._button("▲ Z+", STYLE_JOG, lambda: self._send_jog(0, 0, self.current_step), True))
+        v_z.addWidget(self._button("Z +5", STYLE_HOME, lambda: self.send_gcode("G90 G0 Z5 F1500"), True))
+        v_z.addWidget(self._button("▼ Z-", STYLE_JOG, lambda: self._send_jog(0, 0, -self.current_step), True))
+        h_axes.addLayout(v_z, stretch=1)
+        main.addLayout(h_axes)
 
-        btn_y_plus = QPushButton("▲ Y+")
-        btn_y_minus = QPushButton("▼ Y-")
-        btn_x_minus = QPushButton("◀ X-")
-        btn_x_plus = QPushButton("▶ X+")
-        btn_home_xy = QPushButton("XY 0")
-        btn_home_xy.setStyleSheet("""
-            QPushButton {
-                background-color: #1f222a;
-                color: #00a4ef;
-                border: 1px solid #3c3c44;
-                border-radius: 6px;
-                font-weight: bold;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #2b2b32; }
-            QPushButton:pressed { background-color: #0078d4; color: white; }
-        """)
-
-        for b in [btn_y_plus, btn_y_minus, btn_x_minus, btn_x_plus]:
-            b.setStyleSheet(btn_style_jog)
-
-        btn_y_plus.clicked.connect(lambda: self._send_jog(0, self.current_step, 0))
-        btn_y_minus.clicked.connect(lambda: self._send_jog(0, -self.current_step, 0))
-        btn_x_minus.clicked.connect(lambda: self._send_jog(-self.current_step, 0, 0))
-        btn_x_plus.clicked.connect(lambda: self._send_jog(self.current_step, 0, 0))
-        btn_home_xy.clicked.connect(lambda: self.send_gcode("G90 G0 X0 Y0 F4000"))
-
-        grid_xy.addWidget(btn_y_plus, 0, 1)
-        grid_xy.addWidget(btn_x_minus, 1, 0)
-        grid_xy.addWidget(btn_home_xy, 1, 1)
-        grid_xy.addWidget(btn_x_plus, 1, 2)
-        grid_xy.addWidget(btn_y_minus, 2, 1)
-
-        h_jog_axes.addLayout(grid_xy, stretch=3)
-
-        # Kolumna osi Z
-        v_jog_z = QVBoxLayout()
-        v_jog_z.setSpacing(4)
-
-        btn_z_plus = QPushButton("▲ Z+")
-        btn_z_minus = QPushButton("▼ Z-")
-        btn_z_park = QPushButton("Z +5")
-
-        for b in [btn_z_plus, btn_z_minus]:
-            b.setStyleSheet(btn_style_jog)
-
-        btn_z_park.setStyleSheet(btn_home_xy.styleSheet())
-
-        btn_z_plus.clicked.connect(lambda: self._send_jog(0, 0, self.current_step))
-        btn_z_minus.clicked.connect(lambda: self._send_jog(0, 0, -self.current_step))
-        btn_z_park.clicked.connect(lambda: self.send_gcode("G90 G0 Z5 F1500"))
-
-        v_jog_z.addWidget(btn_z_plus)
-        v_jog_z.addWidget(btn_z_park)
-        v_jog_z.addWidget(btn_z_minus)
-
-        h_jog_axes.addLayout(v_jog_z, stretch=1)
-        main_layout.addLayout(h_jog_axes)
-
-        # -------------------------------------------------------------
-        # 3. ZEROWANIE WSPÓŁRZĘDNYCH ROBOCZYCH (G10 L20)
-        # -------------------------------------------------------------
-        zero_label = QLabel("Układ roboczy (Work Offset):")
-        zero_label.setStyleSheet("color: #aaa; font-weight: 500;")
-        main_layout.addWidget(zero_label)
-
+        # 3. Układ roboczy
+        main.addWidget(self._section_label("Układ roboczy (Work Offset):"))
         grid_zero = QGridLayout()
         grid_zero.setSpacing(4)
+        for i, (txt, cmd) in enumerate((("Zeruj XY", "G10 L20 P1 X0 Y0"), ("Zeruj Y", "G10 L20 P1 Y0"),
+                                        ("Zeruj Z", "G10 L20 P1 Z0"), ("Zeruj XYZ", "G10 L20 P1 X0 Y0 Z0"))):
+            grid_zero.addWidget(self._button(txt, STYLE_ZERO, lambda _=False, c=cmd: self.send_gcode(c), True), i // 2, i % 2)
+        main.addLayout(grid_zero)
 
-        btn_zero_style = """
-            QPushButton {
-                background-color: #0e4f7a;
-                color: #ffffff;
-                border: 1px solid #1a6294;
-                border-radius: 4px;
-                padding: 6px;
-                font-weight: 600;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #116296; }
-            QPushButton:pressed { background-color: #093756; }
-        """
-
-        btn_zero_xy = QPushButton("Zeruj XY")
-        btn_zero_y = QPushButton("Zeruj Y")
-        btn_zero_z = QPushButton("Zeruj Z")
-        btn_zero_all = QPushButton("Zeruj XYZ")
-
-        for b in [btn_zero_xy, btn_zero_y, btn_zero_z, btn_zero_all]:
-            b.setStyleSheet(btn_zero_style)
-
-        btn_zero_xy.clicked.connect(lambda: self.send_gcode("G10 L20 P1 X0 Y0"))
-        btn_zero_y.clicked.connect(lambda: self.send_gcode("G10 L20 P1 Y0"))
-        btn_zero_z.clicked.connect(lambda: self.send_gcode("G10 L20 P1 Z0"))
-        btn_zero_all.clicked.connect(lambda: self.send_gcode("G10 L20 P1 X0 Y0 Z0"))
-
-        grid_zero.addWidget(btn_zero_xy, 0, 0)
-        grid_zero.addWidget(btn_zero_y, 0, 1)
-        grid_zero.addWidget(btn_zero_z, 1, 0)
-        grid_zero.addWidget(btn_zero_all, 1, 1)
-        main_layout.addLayout(grid_zero)
-
-        # -------------------------------------------------------------
-        # 4. SZYBKIE AKCJE (Plamka celująca, Odblokuj, Baza $H)
-        # -------------------------------------------------------------
+        # 4. Szybkie akcje
         h_actions = QHBoxLayout()
         h_actions.setSpacing(4)
-
-        self.btn_focus = QPushButton("💡 Plamka 0.5%")
+        self.btn_focus = self._button("💡 Plamka 0.5%", STYLE_FOCUS, self._toggle_laser_focus, True)
         self.btn_focus.setCheckable(True)
-        self.btn_focus.setStyleSheet("""
-            QPushButton {
-                background-color: #2b2b30;
-                color: #e0e0e0;
-                border: 1px solid #3c3c44;
-                border-radius: 4px;
-                padding: 6px;
-                font-weight: bold;
-            }
-            QPushButton:checked {
-                background-color: #107c41;
-                border-color: #107c41;
-                color: white;
-            }
-        """)
-        self.btn_focus.clicked.connect(self._toggle_laser_focus)
-
-        btn_unlock = QPushButton("🔓 Odblokuj ($X)")
-        btn_unlock.setStyleSheet("""
-            QPushButton {
-                background-color: #3a3a42;
-                color: #f0f0f0;
-                border: 1px solid #4e4e58;
-                border-radius: 4px;
-                padding: 6px;
-            }
-            QPushButton:hover { background-color: #484852; }
-        """)
-        btn_unlock.clicked.connect(lambda: self.send_gcode("$X"))
-
-        btn_home = QPushButton("🏠 Baza ($H)")
-        btn_home.setStyleSheet(btn_unlock.styleSheet())
-        btn_home.clicked.connect(lambda: self.send_gcode("$H"))
-
+        self.btn_unlock = self._button("🔓 Odblokuj ($X)", STYLE_ACTION, self._unlock,
+                                       tooltip="Kasuje alarm GRBL lub potwierdza błąd zadania")
+        self.btn_home = self._button("🏠 Baza ($H)", STYLE_ACTION, lambda: self.send_gcode("$H"))
         h_actions.addWidget(self.btn_focus)
-        h_actions.addWidget(btn_unlock)
-        h_actions.addWidget(btn_home)
-        main_layout.addLayout(h_actions)
-        # Duży pasek STOP wewnątrz modułu Jog
-        self.btn_jog_stop = QPushButton("🛑 ZATRZYMAJ RUCH (HOLD)")
-        self.btn_jog_stop.setStyleSheet("""
-            QPushButton {
-                background-color: #8b0000;
-                color: white;
-                font-weight: bold;
-                padding: 8px;
-                border-radius: 4px;
-                border: 1px solid #d13438;
-            }
-            QPushButton:hover { background-color: #b30000; }
-            QPushButton:pressed { background-color: #500000; }
-        """)
-        self.btn_jog_stop.clicked.connect(self._emergency_hold)
-        main_layout.addWidget(self.btn_jog_stop)
+        h_actions.addWidget(self.btn_unlock)
+        h_actions.addWidget(self.btn_home)
+        main.addLayout(h_actions)
 
-    def _emergency_hold(self):
-        """Wysyła natychmiastowe przerwanie ruchu i zgaszenie plamki."""
-        if self.ws_client and self.ws_client.isValid():
-            self.ws_client.sendTextMessage("!")
-            self.ws_client.sendTextMessage("M5")
-            self.ws_client.sendTextMessage("\x85")
-        if self.btn_focus.isChecked():
+        # 5. Sterowanie zadaniem
+        main.addWidget(self._section_label("Zadanie:"))
+        h_job = QHBoxLayout()
+        h_job.setSpacing(4)
+        self.btn_pause = self._button("⏸ Pauza", STYLE_PAUSE, self._pause,
+                                      tooltip="Feed hold – zadanie zostaje w pamięci i można je wznowić")
+        self.btn_resume = self._button("▶ Wznów", STYLE_RESUME, self._resume,
+                                       tooltip="Wyjście z Hold/Door i kontynuacja zadania (zablokowane po anulowaniu)")
+        h_job.addWidget(self.btn_pause)
+        h_job.addWidget(self.btn_resume)
+        main.addLayout(h_job)
+
+        self.btn_jog_stop = self._button(
+            "🛑 STOP – ANULUJ I WYCZYŚĆ", STYLE_STOP, self.emergency_stop,
+            tooltip="Feed hold, a po zatrzymaniu soft-reset: usuwa z pamięci GRBL niewykonane linie.\n"
+                    "Wyprowadza maszynę z Hold także po przycisku bezpieczeństwa."
+        )
+        main.addWidget(self.btn_jog_stop)
+
+    # ------------------------------------------------------------------ stan
+    def _on_disconnected(self):
+        self.update_state(None)
+
+    def update_state(self, state: Optional[Dict[str, Any]]):
+        """Włącza tylko akcje bezpieczne w bieżącym stanie maszyny i zadania."""
+        connected = bool(self.bridge and self.bridge.is_connected() and state)
+        status = str((state or {}).get("status", ""))
+        job_state = str((state or {}).get("job_state", "idle"))
+        base_status = status.split(":")[0]
+
+        idle = connected and base_status in ("Idle", "Jog") and job_state == "idle"
+        alarm = connected and base_status == "Alarm"
+        held = connected and base_status in ("Hold", "Door")
+        job_active = connected and job_state in ("running", "paused", "cancelling")
+        door_open = status in ("Door:1", "Door:2", "Door:3")
+
+        for btn in self._motion_buttons:
+            btn.setEnabled(idle)
+        self.btn_home.setEnabled(connected and (idle or alarm))
+        self.btn_unlock.setEnabled(connected and not job_active and (alarm or job_state == "error" or idle))
+        self.btn_pause.setEnabled(connected and job_state == "running" and not held
+                                  and bool(self.bridge and self.bridge.supports_job_control))
+        self.btn_resume.setEnabled(connected and (held or job_state == "paused") and not door_open
+                                   and status not in ("Hold:1",) and job_state not in ("cancelling", "error"))
+        # STOP zawsze dostępny przy połączeniu – telemetria może być opóźniona
+        self.btn_jog_stop.setEnabled(connected)
+
+        if not connected:
             self.btn_focus.setChecked(False)
-    
+            self.lbl_state.setText("Rozłączony")
+            self.lbl_state.setStyleSheet("color: #888; font-weight: bold;")
+            return
+
+        names = {"idle": "brak zadania", "running": "w toku", "paused": "wstrzymane",
+                 "cancelling": "anulowanie…", "error": "przerwane błędem"}
+        text = f"GRBL: {status or '?'} | zadanie: {names.get(job_state, job_state)}"
+        if (state or {}).get("job_running"):
+            text += f" ({float(state.get('job_progress', 0.0)):.0f}%)"
+        if door_open:
+            text += "\nDrzwi/obwód bezpieczeństwa otwarty – zamknij, aby wznowić."
+        elif status == "Hold:1":
+            text += "\nHamowanie…"
+        if alarm:
+            text += f"\nAlarm {state.get('alarm') or ''} – Odblokuj ($X); po utracie pozycji wykonaj bazowanie."
+        if job_state == "error" and state.get("last_error"):
+            text += f"\n{state['last_error']}"
+        color = _STATUS_COLORS.get(base_status, "#374151")
+        self.lbl_state.setText(text)
+        self.lbl_state.setStyleSheet(
+            f"background-color: {color}; color: white; padding: 4px 6px; border-radius: 4px; font-weight: bold;")
+
+    # ------------------------------------------------------------------ akcje
     def _set_step(self, val: float):
         self.current_step = val
 
     def _send_jog(self, dx: float, dy: float, dz: float):
-        """Wysyła polecenie płynnego ruchu GRBL Jog ($J=...)."""
-        feed = 800 if dz != 0 else (1000 if self.current_step <= 1.0 else 3000)
+        """Płynny ruch GRBL Jog ($J=...) w układzie przyrostowym."""
+        feed = 800 if dz else (1000 if self.current_step <= 1.0 else 3000)
         parts = ["$J=G91"]
-        if dx != 0:
-            parts.append(f"X{dx:.3f}")
-        if dy != 0:
-            parts.append(f"Y{dy:.3f}")
-        if dz != 0:
-            parts.append(f"Z{dz:.3f}")
+        for axis, val in (("X", dx), ("Y", dy), ("Z", dz)):
+            if val:
+                parts.append(f"{axis}{val:.3f}")
         parts.append(f"F{feed}")
-
-        cmd = " ".join(parts)
-        self.send_gcode(cmd)
+        self.send_gcode(" ".join(parts))
 
     def _toggle_laser_focus(self):
-        self.laser_focus_active = self.btn_focus.isChecked()
-        if self.laser_focus_active:
-            # Włączenie wiązki 0.5% (S5 przy $30=1000)
-            self.send_gcode("M3 S5")
-        else:
-            self.send_gcode("M5")
+        # Plamka celownicza 0.5% (S5 przy $30=1000)
+        self.send_gcode("M3 S5" if self.btn_focus.isChecked() else "M5")
+
+    def _pause(self):
+        if self.bridge:
+            self.bridge.pause()
+
+    def _resume(self):
+        if self.bridge:
+            self.bridge.resume()
+
+    def _unlock(self):
+        if not self.bridge:
+            return
+        state = self.bridge.state or {}
+        if state.get("job_state") == "error":
+            self.bridge.acknowledge_error()
+        if str(state.get("status", "")).startswith("Alarm") or state.get("job_state") != "error":
+            self.bridge.unlock()
+
+    def emergency_stop(self):
+        """Anuluj zadanie i wyczyść bufor GRBL (bezpieczne wyjście z Hold)."""
+        if self.btn_focus.isChecked():
+            self.btn_focus.setChecked(False)
+        if self.bridge:
+            self.bridge.cancel()
+        self.command_sent.emit("STOP")
 
     def send_gcode(self, cmd: str):
-        """Kieruje polecenie do WebSocketu lub emituje sygnał."""
-        if self.ws_client and self.ws_client.isValid():
-            self.ws_client.sendTextMessage(cmd)
-        self.command_sent.emit(cmd)
+        if self.bridge and self.bridge.send_gcode(cmd):
+            self.command_sent.emit(cmd)
