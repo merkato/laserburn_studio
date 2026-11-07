@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import sys
 import io
 import urllib.request
@@ -14,7 +15,7 @@ from shapely.geometry import Polygon, MultiPolygon, LineString, LinearRing, Mult
 import numpy as np
 
 from PySide6.QtCore import (
-    Qt, QPointF, QRectF, Signal, QObject, QUrl, QThread, QSize, QElapsedTimer
+    Qt, QPointF, QRectF, Signal, QObject, QUrl, QThread, QSize, QElapsedTimer, QTimer
 )
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QWheelEvent, QMouseEvent, QKeyEvent,
@@ -51,6 +52,7 @@ from time_estimator import CycleTimeEstimator
 from material_tester import MaterialTestDialog
 from shapes import SHAPES, SHAPE_LABELS, SHAPE_ICONS, ShapeSpec, build_path
 from shape_dialog import ShapeDialog
+from app_info import APP_NAME, APP_VERSION, resource_path, user_data_dir
 
 
 # ==============================================================================
@@ -710,7 +712,7 @@ class LaserCrosshairItem(QGraphicsItem):
 class LaserBurnStudio(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LaserBurn Studio — Stół roboczy")
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION} — Stół roboczy")
         self.resize(1440, 900)
 
         self.bed_w = 300.0
@@ -2417,7 +2419,10 @@ class LaserBurnStudio(QMainWindow):
         )
         if not file_path:
             return
+        self.open_project_file(file_path)
 
+    def open_project_file(self, file_path: str):
+        """Wczytuje projekt (.lcam) – z okna dialogowego lub z wiersza poleceń / skojarzenia pliku."""
         try:
             warnings = ProjectSerializer.load_from_file(self, file_path)
             self.status.showMessage(f"Projekt wczytany: {file_path}", 5000)
@@ -2533,8 +2538,42 @@ class LaserBurnStudio(QMainWindow):
 
             self.status.showMessage(f"Test wczytany pomyślnie. Wygenerowano {len(new_layers_data)} unikalnych warstw dla maszyny.", 6000)
 
+def _install_crash_log():
+    """W wersji bez konsoli nieobsłużony wyjątek trafia do logu i okna komunikatu zamiast znikać."""
+    import traceback
+    import datetime
+
+    log_path = user_data_dir() / "laserburn.log"
+
+    def hook(exc_type, exc, tb):
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n=== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} {APP_NAME} {APP_VERSION} ===\n{text}")
+        except OSError:
+            pass
+        if sys.stderr is not None:
+            sys.stderr.write(text)
+        if QApplication.instance() is not None:
+            QMessageBox.critical(None, APP_NAME,
+                                 f"Wystąpił nieoczekiwany błąd:\n\n{exc}\n\nSzczegóły zapisano w:\n{log_path}")
+
+    sys.excepthook = hook
+
+
 if __name__ == "__main__":
+    _install_crash_log()
+    if sys.platform == "win32":
+        try:  # własna ikona na pasku zadań zamiast ikony Pythona
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("LaserBurnStudio.App")
+        except (AttributeError, OSError):
+            pass
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+    app.setWindowIcon(QIcon(str(resource_path("assets/laserburn.png"))))
     app.setStyle("Fusion")
 
     app.setStyleSheet("""
@@ -2624,4 +2663,14 @@ if __name__ == "__main__":
 
     window = LaserBurnStudio()
     window.show()
+    # Dwuklik na pliku .lcam (skojarzenie z instalatora) przekazuje ścieżkę jako argument
+    project_args = [a for a in sys.argv[1:] if a.lower().endswith(".lcam") and os.path.isfile(a)]
+    if project_args:
+        window.open_project_file(project_args[0])
+    if "--smoke-test" in sys.argv:
+        # Test wersji spakowanej (build.py): okno powstało, G-code się generuje → kod 0
+        def _smoke():
+            import smoke_test
+            QApplication.instance().exit(smoke_test.run(window))
+        QTimer.singleShot(1500, _smoke)
     sys.exit(app.exec())
