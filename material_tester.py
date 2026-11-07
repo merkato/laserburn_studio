@@ -226,6 +226,7 @@ class MaterialTestDialog(QDialog):
                     "power": float(power_val),
                     "passes": int(self.spin_passes.value()),
                     "mode": "Fill" if is_fill_test else "Line",
+                    "operation": "fill" if is_fill_test else "cut",
                     "hatch_interval": float(self.spin_hatch_interval.value()),
                     "hatch_angle": float(self.spin_hatch_angle.value()),
                     "output": True

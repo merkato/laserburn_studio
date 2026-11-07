@@ -272,6 +272,7 @@ class ProjectSerializer:
                 "name": l.name,
                 "color": QColor(l.color).name(),
                 "mode": l.mode,
+                "operation": getattr(l, "operation", None),
                 "speed": float(l.speed),
                 "power": float(l.power),
                 "passes": int(l.passes),
@@ -340,6 +341,7 @@ class ProjectSerializer:
             "version": PROJECT_VERSION,
             "bed": {"width": float(studio.bed_w), "height": float(studio.bed_h)},
             "layers": layers_data,
+            "material_id": getattr(studio, "current_material_id", None),
             "material_boundary": [[float(p[0]), float(p[1])] for p in getattr(studio, "boundary_points", [])],
             "items": items_data,
         }
@@ -375,6 +377,7 @@ class ProjectSerializer:
                     name=str(ld.get("name", f"Warstwa {idx + 1}")),
                     color=_color(ld.get("color")),
                     mode=ld.get("mode", "Line") if ld.get("mode") in ("Line", "Fill", "Image") else "Line",
+                    operation=ld.get("operation"),
                     speed=_num(ld.get("speed"), 1000.0),
                     power=_num(ld.get("power"), 50.0),
                     passes=max(1, int(_num(ld.get("passes"), 1))),
@@ -394,6 +397,15 @@ class ProjectSerializer:
             warnings.append("Projekt nie zawiera warstw – zachowano bieżące.")
         if hasattr(studio, "_populate_layer_table"):
             studio._populate_layer_table()
+
+        # Materiał zastosowany w projekcie (tylko informacyjnie – parametry są zapisane w warstwach)
+        material_id = data.get("material_id")
+        studio.current_material_id = material_id if isinstance(material_id, str) else None
+        library = getattr(studio, "material_library", None)
+        if studio.current_material_id and library is not None and library.get(studio.current_material_id) is None:
+            warnings.append(f"Materiał projektu „{studio.current_material_id}” nie występuje w bazie materiałów.")
+        if hasattr(studio, "_refresh_material_combo"):
+            studio._refresh_material_combo()
 
         # 3. Obiekty
         loaded = 0

@@ -40,6 +40,10 @@ from gcode_visualizer import GCodeVisualizerDialog
 from jog_panel import JogPanelWidget
 from bridge_client import BridgeClient
 from material_fitting import MaterialFittingOptimizer
+from material_library import (
+    MaterialLibrary, MaterialLibraryError, OPERATION_MODE, MODE_OPERATION, OPERATION_LABELS,
+    apply_to_layers as apply_material_to_layers
+)
 from rulers import CanvasWithRulers
 from path_optimizer import PathOptimizer
 from project_manager import ProjectSerializer, ProjectFormatError
@@ -53,10 +57,13 @@ from material_tester import MaterialTestDialog
 
 class LayerConfig:
     def __init__(self, name: str, color: QColor, mode: str = "Line", speed: float = 1200.0, power: float = 80.0, passes: int = 1, kerf: float = 0.15,
-                 hatch_interval: float = 0.1, hatch_angle: float = 0.0):
+                 hatch_interval: float = 0.1, hatch_angle: float = 0.0, operation: Optional[str] = None):
         self.name = name
         self.color = QColor(color)  # Akceptuje QColor lub zapis "#RRGGBB"
-        self.mode = mode         # "Line", "Fill", "Image"
+        # Operacja technologiczna (cut/line/fill/image) wyznacza tryb generatora G-code.
+        # Bez jawnej operacji jest wyprowadzana z trybu (Line -> line).
+        self.operation = operation if operation in OPERATION_MODE else MODE_OPERATION.get(mode, "line")
+        self.mode = OPERATION_MODE[self.operation]  # "Line", "Fill", "Image"
         self.speed = speed       # mm/min
         self.power = power       # %
         self.passes = passes
@@ -65,6 +72,11 @@ class LayerConfig:
         self.hatch_angle = hatch_angle        # Fill: kąt kreskowania w stopniach
         self.output = True
         self.visible = True
+
+    def set_operation(self, operation: str):
+        if operation in OPERATION_MODE:
+            self.operation = operation
+            self.mode = OPERATION_MODE[operation]
 
 
 class MachineModel(QObject):
@@ -705,10 +717,19 @@ class LaserBurnStudio(QMainWindow):
         # Wewnętrzny schowek CAD
         self._internal_clipboard: List[Dict[str, Any]] = []
 
+        # Baza materiałów (JSON w katalogu użytkownika); błąd odczytu nie blokuje programu
+        self.material_library = MaterialLibrary()
+        self.current_material_id: Optional[str] = None
+        self._material_load_error = ""
+        try:
+            self.material_library.load()
+        except MaterialLibraryError as e:
+            self._material_load_error = str(e)
+
         self.layers: List[LayerConfig] = [
             LayerConfig("00 - Czarny (Grawer)", QColor("#000000"), mode="Line", speed=3000.0, power=25.0, passes=1, kerf=0.00),
             LayerConfig("01 - Niebieski (Fill)", QColor("#0000FF"), mode="Fill", speed=2000.0, power=45.0, passes=1, kerf=0.00),
-            LayerConfig("02 - Czerwony (Cięcie)", QColor("#FF0000"), mode="Line", speed=450.0,  power=90.0, passes=2, kerf=0.15),
+            LayerConfig("02 - Czerwony (Cięcie)", QColor("#FF0000"), mode="Line", speed=450.0,  power=90.0, passes=2, kerf=0.15, operation="cut"),
             LayerConfig("03 - Zielony (Raster)", QColor("#00C850"), mode="Image", speed=3500.0, power=60.0, passes=1, kerf=0.00),
         ]
 
@@ -896,10 +917,13 @@ class LaserBurnStudio(QMainWindow):
         menu_machine.addSeparator()
         menu_machine.addAction(self.act_sim)
         menu_machine.addAction(self.act_material_test)
-
-        # Dodanie do menu Maszyna w _setup_menus:
-        menu_machine.addAction(self.act_material_test)
         self.act_material_test.triggered.connect(self._open_material_tester)
+
+        self.act_materials = QAction("📚 Baza materiałów...", self)
+        self.act_materials.setShortcut(QKeySequence("Ctrl+M"))
+        self.act_materials.setToolTip("Zapisane ustawienia cięcia, linii, fill i rastra dla materiałów (Ctrl+M)")
+        self.act_materials.triggered.connect(self._open_material_library)
+        menu_machine.addAction(self.act_materials)
 
     def _setup_project_toolbar(self):
         self.proj_toolbar = QToolBar("Pasek Maszyny")
@@ -1110,7 +1134,7 @@ class LaserBurnStudio(QMainWindow):
         self.layer_table = QTableWidget()
         self.layer_table.setColumnCount(7)
         self.layer_table.setHorizontalHeaderLabels([
-            "Warstwa", "Tryb", "F [mm/min]", "Moc [%]", "Pętla", "Kerf [mm]", "Wł."
+            "Warstwa", "Operacja", "F [mm/min]", "Moc [%]", "Pętla", "Kerf [mm]", "Wł."
         ])
         self.layer_table.verticalHeader().setVisible(False)
         self.layer_table.verticalHeader().setDefaultSectionSize(28)
@@ -1127,6 +1151,25 @@ class LaserBurnStudio(QMainWindow):
         self.layer_table.setColumnWidth(4, 50)
         self.layer_table.setColumnWidth(5, 65)
         self.layer_table.setColumnWidth(6, 35)
+
+        # Szybki wybór materiału: ustawia warstwy wg ich operacji (Cięcie/Linia/Fill/Raster)
+        h_material = QHBoxLayout()
+        h_material.setSpacing(4)
+        h_material.addWidget(QLabel("Materiał:"))
+        self.combo_material = QComboBox()
+        self.combo_material.setToolTip("Materiał z bazy – parametry trafią do warstw o pasującej operacji")
+        h_material.addWidget(self.combo_material, 1)
+        self.btn_apply_material = QPushButton("Zastosuj")
+        self.btn_apply_material.clicked.connect(
+            lambda: self._apply_material(self.combo_material.currentData()))
+        h_material.addWidget(self.btn_apply_material)
+        btn_material_lib = QPushButton("📚")
+        btn_material_lib.setToolTip("Baza materiałów (Ctrl+M)")
+        btn_material_lib.setFixedWidth(34)
+        btn_material_lib.clicked.connect(self._open_material_library)
+        h_material.addWidget(btn_material_lib)
+        layers_layout.addLayout(h_material)
+        self._refresh_material_combo()
 
         layers_layout.addWidget(self.layer_table)
 
@@ -1778,10 +1821,14 @@ class LaserBurnStudio(QMainWindow):
             name_item.setFont(QFont("Segoe UI", 9, QFont.Bold))
             name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
 
+            # Operacja technologiczna: Cięcie i Linia to tryb Line, ale osobne ustawienia materiału
             combo_mode = QComboBox()
-            combo_mode.addItems(["Line", "Fill", "Image"])
-            combo_mode.setCurrentText(layer.mode)
-            combo_mode.currentTextChanged.connect(lambda val, l=layer: setattr(l, 'mode', val))
+            for op, label in OPERATION_LABELS.items():
+                combo_mode.addItem(label, op)
+            combo_mode.setCurrentIndex(max(0, combo_mode.findData(getattr(layer, "operation", "line"))))
+            combo_mode.setToolTip("Cięcie / Linia → kontur (Line), Fill → kreskowanie, Raster → obraz")
+            combo_mode.currentIndexChanged.connect(
+                lambda _i, l=layer, cb=combo_mode: l.set_operation(cb.currentData()))
             self.layer_table.setCellWidget(r, 1, combo_mode)
 
             spin_spd = QDoubleSpinBox()
@@ -2325,6 +2372,54 @@ class LaserBurnStudio(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Błąd odczytu", f"Nie udało się wczytać projektu:\n{e}")
    
+    # =========================================================================
+    # BAZA MATERIAŁÓW
+    # =========================================================================
+    def _refresh_material_combo(self, select_id: Optional[str] = None):
+        if not hasattr(self, "combo_material"):
+            return
+        select_id = select_id if select_id is not None else self.current_material_id
+        self.combo_material.blockSignals(True)
+        self.combo_material.clear()
+        self.combo_material.addItem("— wybierz —", None)
+        for m in self.material_library.list():
+            ops = ", ".join(OPERATION_LABELS[o] for o in m.operations)
+            self.combo_material.addItem(m.label, m.id)
+            self.combo_material.setItemData(self.combo_material.count() - 1, f"{m.label}: {ops or 'brak operacji'}", Qt.ToolTipRole)
+        idx = self.combo_material.findData(select_id) if select_id else 0
+        self.combo_material.setCurrentIndex(max(0, idx))
+        self.combo_material.blockSignals(False)
+        self.btn_apply_material.setEnabled(self.combo_material.count() > 1)
+
+    def _apply_material(self, material_id: Optional[str]) -> int:
+        material = self.material_library.get(material_id)
+        if material is None:
+            self.status.showMessage("Wybierz materiał z bazy (📚 Baza materiałów, Ctrl+M).", 4000)
+            return 0
+        changed = apply_material_to_layers(material, self.layers)
+        self.current_material_id = material.id
+        self._populate_layer_table()
+        self._refresh_material_combo(material.id)
+        if changed:
+            names = ", ".join(sorted({OPERATION_LABELS[op] for _, op in changed}))
+            self.status.showMessage(f"Materiał „{material.label}”: ustawiono {len(changed)} warstw ({names}).", 6000)
+        else:
+            self.status.showMessage(f"Materiał „{material.label}” nie ma ustawień dla operacji bieżących warstw.", 6000)
+        return len(changed)
+
+    def _open_material_library(self):
+        if self._material_load_error:
+            QMessageBox.warning(self, "Baza materiałów",
+                                f"{self._material_load_error}\n\nZapis utworzy nową bazę w miejscu uszkodzonej.")
+            self._material_load_error = ""
+        from materials_dialog import MaterialLibraryDialog
+        dialog = MaterialLibraryDialog(self.material_library, lambda: self.layers,
+                                       current_id=self.combo_material.currentData() or self.current_material_id,
+                                       parent=self)
+        dialog.apply_requested.connect(self._apply_material)
+        dialog.exec()
+        self._refresh_material_combo()
+
     def _open_material_tester(self):
         """Otwiera generator testu, wstawia geometrię i przebudowuje QTableWidget z warstwami testu."""
         from material_tester import MaterialTestDialog
@@ -2364,6 +2459,7 @@ class LaserBurnStudio(QMainWindow):
                     power=l_data["power"],
                     passes=l_data["passes"],
                     mode=l_data["mode"],
+                    operation=l_data.get("operation"),
                     hatch_interval=l_data.get("hatch_interval", 0.1),
                     hatch_angle=l_data.get("hatch_angle", 0.0)
                 )
