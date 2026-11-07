@@ -5,7 +5,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QVBoxLayout, QFormLayout, QListWidget, QListWidgetItem, QPushButton,
     QLineEdit, QDoubleSpinBox, QSpinBox, QPlainTextEdit, QTableWidget, QHeaderView, QCheckBox,
-    QWidget, QLabel, QMessageBox, QAbstractSpinBox
+    QWidget, QLabel, QMessageBox
 )
 
 from material_library import (
@@ -87,13 +87,15 @@ class MaterialLibraryDialog(QDialog):
                 sp.setRange(lo, hi)
                 if typ is not int:
                     sp.setDecimals(_DECIMALS.get(fname, 2))
-                sp.setButtonSymbols(QAbstractSpinBox.NoButtons)
+                # Bez NoButtons: przy arkuszu stylów aplikacji (padding) Qt zwęża wtedy pole tekstu
+                # do 1 px i wartość jest niewidoczna. Strzałki jak w tabeli warstw.
+                sp.setMinimumWidth(70)
                 sp.setValue(default)
                 sp.valueChanged.connect(self._mark_dirty)
                 self.table.setCellWidget(r, c, sp)
                 widgets[fname] = sp
             self._row_widgets[op] = widgets
-        right.addWidget(self.table)
+        right.addWidget(self.table, 1)  # nadmiar wysokości dla tabeli, nie dla formularza
 
         self.lbl_info = QLabel(f"Plik: {self.library.path}")
         self.lbl_info.setStyleSheet("color: #888;")

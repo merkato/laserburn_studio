@@ -60,7 +60,7 @@ class MaterialTestDialog(QDialog):
         self.grid_params.addWidget(QLabel("Moc [%]:"), 0, 0)
         h_p = QHBoxLayout()
         self.spin_pmin, self.spin_pmax = QSpinBox(), QSpinBox()
-        self.spin_pmin.setRange(5, 100); self.spin_pmax.setRange(5, 100)
+        self.spin_pmin.setRange(1, 100); self.spin_pmax.setRange(1, 100)
         self.spin_pmin.setValue(30); self.spin_pmax.setValue(80)
         h_p.addWidget(self.spin_pmin); h_p.addWidget(QLabel("-")); h_p.addWidget(self.spin_pmax)
         self.grid_params.addLayout(h_p, 0, 1)
@@ -118,8 +118,9 @@ class MaterialTestDialog(QDialog):
             self.spin_pmin.setValue(30); self.spin_pmax.setValue(80)
             self.spin_passes.setValue(2); self.spin_passes.setEnabled(True)
         else:
-            self.spin_smin.setValue(1000); self.spin_smax.setValue(4000)
-            self.spin_pmin.setValue(20); self.spin_pmax.setValue(60)
+            # Fill: już 5% przy 1500 mm/min daje głębokie wypalenie (sklejka brzozowa, 2026-11-07)
+            self.spin_smin.setValue(1500); self.spin_smax.setValue(4000)
+            self.spin_pmin.setValue(2); self.spin_pmax.setValue(12)
             self.spin_passes.setValue(1); self.spin_passes.setEnabled(False)
         is_fill = index == 1
         self.spin_hatch_interval.setEnabled(is_fill)
@@ -150,6 +151,16 @@ class MaterialTestDialog(QDialog):
             colors.append(color)
         return colors
 
+    def _power_at(self, i: int) -> float:
+        """Moc i-tego wiersza, zaokrąglona do 0.5% – ta sama wartość w opisie i w warstwie."""
+        pmin, pmax, steps = self.spin_pmin.value(), self.spin_pmax.value(), self.spin_steps_p.value()
+        return round((pmin + (pmax - pmin) * (i / max(1, steps - 1))) * 2.0) / 2.0
+
+    def _speed_at(self, j: int) -> float:
+        """Prędkość j-tej kolumny, zaokrąglona do 10 mm/min."""
+        smin, smax, steps = self.spin_smin.value(), self.spin_smax.value(), self.spin_steps_s.value()
+        return float(round((smin + (smax - smin) * (j / max(1, steps - 1))) / 10.0) * 10)
+
     def generate_test_data(self, start_pos: QPointF = QPointF(10.0, 10.0)) -> Tuple[List[QGraphicsItem], List[dict]]:
         items: List[QGraphicsItem] = []
         layer_configs: List[dict] = []
@@ -177,9 +188,9 @@ class MaterialTestDialog(QDialog):
         
         # 2. Generowanie osi X (Prędkości - na dole pod rzędem 0)
         for j in range(steps_s):
-            speed_val = smin + (smax - smin) * (j / max(1, steps_s - 1))
+            speed_val = self._speed_at(j)
             t_path = QPainterPath()
-            t_path.addText(0, 0, font, f"S{int(speed_val)}")
+            t_path.addText(0, 0, font, f"S{speed_val:g}")
             
             # Odwrócenie tekstu i pozycjonowanie pod dolnym wierszem
             tr = QTransform()
@@ -194,9 +205,9 @@ class MaterialTestDialog(QDialog):
 
         # 3. Generowanie osi Y (Moce - po lewej stronie rzędu j=0)
         for i in range(steps_p):
-            power_val = pmin + (pmax - pmin) * (i / max(1, steps_p - 1))
+            power_val = self._power_at(i)
             t_path = QPainterPath()
-            t_path.addText(0, 0, font, f"{int(power_val)}%")
+            t_path.addText(0, 0, font, f"{power_val:g}%")
             
             tr = QTransform()
             tr.translate(grid_x - 14.0, grid_y + i * step_y + box_size / 2.0 - 2.0)
@@ -213,14 +224,14 @@ class MaterialTestDialog(QDialog):
         cell_colors = self._unique_cell_colors(steps_p * steps_s, reserved=("#00ffff", "#808080"))
         for i in range(steps_p):
             for j in range(steps_s):
-                power_val = pmin + (pmax - pmin) * (i / max(1, steps_p - 1))
-                speed_val = smin + (smax - smin) * (j / max(1, steps_s - 1))
+                power_val = self._power_at(i)
+                speed_val = self._speed_at(j)
 
                 # Unikalny kolor dla każdej komórki (kolor = przypisanie do warstwy)
                 color = cell_colors[layer_counter]
 
                 layer_configs.append({
-                    "name": f"P{int(power_val)} S{int(speed_val)}",
+                    "name": f"P{power_val:g} S{speed_val:g}",
                     "color": color.name(),
                     "speed": float(speed_val),
                     "power": float(power_val),
