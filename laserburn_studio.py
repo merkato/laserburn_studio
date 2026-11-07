@@ -49,6 +49,8 @@ from path_optimizer import PathOptimizer
 from project_manager import ProjectSerializer, ProjectFormatError
 from time_estimator import CycleTimeEstimator
 from material_tester import MaterialTestDialog
+from shapes import SHAPES, SHAPE_LABELS, SHAPE_ICONS, ShapeSpec, build_path
+from shape_dialog import ShapeDialog
 
 
 # ==============================================================================
@@ -746,7 +748,6 @@ class LaserBurnStudio(QMainWindow):
 
         self._setup_ui()
         self._setup_canvas()
-        self._connect_signals()
 
         self.crosshair = LaserCrosshairItem(radius=8.0)
         self.crosshair.setVisible(False)
@@ -883,6 +884,15 @@ class LaserBurnStudio(QMainWindow):
         self.act_material_test.setShortcut(QKeySequence("Ctrl+T"))
         self.act_material_test.setToolTip("Stwórz siatkę testową mocy, prędkości i cięcia (Ctrl+T)")
 
+        # Kształty: każdy otwiera okno wymiarów z wybranym rodzajem
+        self.shape_actions = {}
+        for kind in SHAPES:
+            act = QAction(f"{SHAPE_ICONS[kind]} {SHAPE_LABELS[kind]}...", self)
+            act.setToolTip(f"Wstaw: {SHAPE_LABELS[kind]} (dokładne wymiary w mm)")
+            act.triggered.connect(lambda checked=False, k=kind: self.insert_shape(k))
+            self.shape_actions[kind] = act
+        self.shape_actions["rect"].setShortcut(QKeySequence("Ctrl+Shift+R"))
+
 
     def _setup_menus(self):
         menubar = self.menuBar()
@@ -907,6 +917,10 @@ class LaserBurnStudio(QMainWindow):
         menu_edit.addAction(self.act_layer_up)
         menu_edit.addAction(self.act_layer_down)
         menu_edit.addAction(self.act_send_back)
+
+        menu_insert = menubar.addMenu("&Wstaw")
+        for kind in SHAPES:
+            menu_insert.addAction(self.shape_actions[kind])
 
         menu_machine = menubar.addMenu("&Maszyna")
         menu_machine.addAction(self.act_connect)
@@ -1103,6 +1117,16 @@ class LaserBurnStudio(QMainWindow):
         self.edit_toolbar.addAction(self.act_layer_up)
         self.edit_toolbar.addAction(self.act_layer_down)
         self.edit_toolbar.addAction(self.act_send_back)
+        self.edit_toolbar.addSeparator()
+
+        # Kształty geometryczne i symbole (w menu pełne nazwy, na pasku same symbole)
+        for kind in SHAPES:
+            act = self.shape_actions[kind]
+            self.edit_toolbar.addAction(act)
+            btn = self.edit_toolbar.widgetForAction(act)
+            if btn is not None:
+                btn.setText(SHAPE_ICONS[kind])
+                btn.setToolButtonStyle(Qt.ToolButtonTextOnly)
 
     def _setup_ui(self):
         self._setup_actions()
@@ -1270,7 +1294,7 @@ class LaserBurnStudio(QMainWindow):
         self.btn_auto_fit = QPushButton("🎯 Wpisz projekt w plaster")
         self.btn_auto_fit.setStyleSheet("background-color: #6c3483; font-weight: bold; padding: 7px;")
         self.btn_auto_fit.setEnabled(False)
-        self.btn_auto_fit.clicked.connect(self._auto_fit_selected_to_material)
+        self.btn_auto_fit.clicked.connect(lambda: self._auto_fit_selected_to_material())
         mat_layout.addWidget(self.btn_auto_fit)
 
         self.box_material.setContentLayout(mat_layout)
@@ -1360,6 +1384,58 @@ class LaserBurnStudio(QMainWindow):
 
         if hasattr(self, "status") and self.status:
             self.status.showMessage(f"Wklejono: {len(pasted_items)} obiekt(ów)", 2500)
+
+    # =========================================================================
+    # KSZTAŁTY GEOMETRYCZNE
+    # =========================================================================
+
+    def _default_shape_center(self) -> Tuple[float, float]:
+        """Środek widocznego fragmentu stołu (przycięty do pola roboczego)."""
+        c = self.view.mapToScene(self.view.viewport().rect().center())
+        return (round(min(max(c.x(), 0.0), self.bed_w), 1), round(min(max(c.y(), 0.0), self.bed_h), 1))
+
+    def insert_shape(self, kind: str = "rect"):
+        layers = [(l.name, QColor(l.color)) for l in self.layers]
+        row = self.layer_table.currentRow()
+        if row < 0:
+            # Domyślnie warstwa cięcia, jeśli istnieje
+            row = next((i for i, l in enumerate(self.layers) if getattr(l, "operation", "") == "cut"), 0)
+        dlg = ShapeDialog(kind, layers, row, self._default_shape_center(), self)
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        return self.add_shape(dlg.spec(), dlg.center(), dlg.layer_index())
+
+    def add_shape(self, spec: ShapeSpec, center: Tuple[float, float], layer_index: int = 0) -> QGraphicsPathItem:
+        """Tworzy obiekt wektorowy kształtu (środek w center) w kolorze wybranej warstwy."""
+        path = build_path(spec)
+        color = QColor(self.layers[layer_index].color) if 0 <= layer_index < len(self.layers) else QColor("#000000")
+        item = QGraphicsPathItem(path)
+        pen = QPen(color, 1.2)
+        pen.setCosmetic(True)
+        item.setPen(pen)
+        item.setFlags(
+            QGraphicsItem.ItemIsSelectable |
+            QGraphicsItem.ItemIsMovable |
+            QGraphicsItem.ItemSendsGeometryChanges
+        )
+        user_z = [it.zValue() for it in self._user_items()]
+        item.setZValue(max(user_z) + 1.0 if user_z else 20.0)
+        item.setData(0, {"type": "shape", "name": SHAPE_LABELS.get(spec.kind, spec.kind), "shape": spec.kind})
+        item.setPos(QPointF(*center))
+        self.scene.addItem(item)
+        self.scene.clearSelection()
+        item.setSelected(True)
+        br = item.sceneBoundingRect()
+        self.status.showMessage(
+            f"Wstawiono: {SHAPE_LABELS.get(spec.kind, spec.kind)} {br.width():.1f} × {br.height():.1f} mm "
+            f"(środek X{center[0]:.1f} Y{center[1]:.1f})", 5000)
+        return item
+
+    def _user_items(self) -> List[QGraphicsItem]:
+        """Obiekty projektu (wektory i rastry), bez elementów pomocniczych kanwy."""
+        return [it for it in self.scene.items()
+                if isinstance(it, (QGraphicsPathItem, QGraphicsPixmapItem)) and 10 <= it.zValue() < 890
+                and it is not self.boundary_item]
 
     def duplicate_selected(self):
         """Klonuje zaznaczone elementy obok w jednym kroku (Ctrl+D)."""
@@ -1908,41 +1984,16 @@ class LaserBurnStudio(QMainWindow):
         self.laser_reticle.setPos(0, 0)
 
     def _on_selection_changed(self):
-        selected = self._get_user_selected_items()
+        try:
+            selected = self._get_user_selected_items()
+        except RuntimeError:
+            return  # scena niszczona przy zamykaniu programu – Qt wciąż emituje selectionChanged
         if selected:
             self.transform_box.set_targets(selected)
             rect = self.transform_box.get_combined_scene_rect()
             self.status.showMessage(f"Zaznaczono obiektów: {len(selected)} (Wymiary: {rect.width():.1f} x {rect.height():.1f} mm)")
         else:
             self.transform_box.set_targets([])
-
-    def _connect_signals(self):
-        if hasattr(self, "btn_tb_import"):
-            self.btn_tb_import.clicked.connect(self._import_svg)
-        if hasattr(self, "btn_tb_connect"):
-            self.btn_tb_connect.clicked.connect(self._toggle_ws_connection)
-        if hasattr(self, "btn_tb_frame"):
-            self.btn_tb_frame.clicked.connect(self.frame_project)
-        if hasattr(self, "btn_tb_start"):
-            self.btn_tb_start.clicked.connect(self.start_job_on_device)
-        if hasattr(self, "btn_tb_stop"):
-            self.btn_tb_stop.clicked.connect(self.emergency_stop)
-
-        if hasattr(self, "btn_sample_pt"):
-            self.btn_sample_pt.clicked.connect(self._on_record_boundary_point)
-        if hasattr(self, "btn_build_contour"):
-            self.btn_build_contour.clicked.connect(self._generate_contour)
-        if hasattr(self, "btn_clear_contour"):
-            self.btn_clear_contour.clicked.connect(self._clear_boundary)
-        if hasattr(self, "btn_auto_fit"):
-            self.btn_auto_fit.clicked.connect(self._auto_fit_selected_to_material)
-
-        if hasattr(self, "btn_add_layer"):
-            self.btn_add_layer.clicked.connect(self._create_new_layer)
-        if hasattr(self, "btn_color_layer"):
-            self.btn_color_layer.clicked.connect(self._change_selected_layer_color)
-        if hasattr(self, "btn_del_layer"):
-            self.btn_del_layer.clicked.connect(self._delete_selected_layer)
 
     def _machine_pos_updated(self, x: float, y: float):
         item = getattr(self, "laser_reticle", None) or getattr(self, "crosshair", None)
@@ -2131,7 +2182,12 @@ class LaserBurnStudio(QMainWindow):
 
         self.scene.update()
 
-    def _auto_fit_selected_to_material(self, margin_mm: float = 5.0):
+    def _auto_fit_selected_to_material(self, margin_mm: Optional[float] = None, allow_rotation: Optional[bool] = None):
+        # Domyślnie wartości z panelu „Plaster drewna” (margines i zgoda na obrót)
+        if margin_mm is None or isinstance(margin_mm, bool):
+            margin_mm = self.spin_fit_margin.value()
+        if allow_rotation is None:
+            allow_rotation = self.chk_allow_rot.isChecked()
         if not hasattr(self, "shapely_material_poly") or self.shapely_material_poly is None:
             if hasattr(self, "status"):
                 self.status.showMessage("Najpierw wyznacz obrys plastra drewna!", 4000)
@@ -2142,7 +2198,7 @@ class LaserBurnStudio(QMainWindow):
         selected_items = self._get_user_selected_items()
         target_items = selected_items if selected_items else [
             it for it in self.scene.items()
-            if it not in helpers and it.zValue() >= 10 and it.isVisible() and it.parentItem() is None
+            if it not in helpers and it.zValue() >= 10 and it.isVisible() and it.topLevelItem() is it
             and isinstance(it, (QGraphicsPathItem, QGraphicsPixmapItem))
         ]
 
@@ -2155,7 +2211,7 @@ class LaserBurnStudio(QMainWindow):
         # obrót tylko gdy projekt nie mieści się w pełnym rozmiarze.
         result = MaterialFittingOptimizer.fit_items(
             target_items, self.shapely_material_poly, margin_mm=margin_mm,
-            allow_rotation=True, angle_step_deg=5.0, max_scale=1.0
+            allow_rotation=allow_rotation, angle_step_deg=5.0, max_scale=1.0
         )
         if result is None:
             if hasattr(self, "status"):

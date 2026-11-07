@@ -28,7 +28,7 @@ _ITEM_FLAGS = (
 )
 
 # Klucze item.data(0), które mają sens po zapisie (proste wartości JSON)
-_PERSISTENT_DATA_KEYS = ("type", "power", "speed", "passes", "name")
+_PERSISTENT_DATA_KEYS = ("type", "power", "speed", "passes", "name", "shape")
 
 
 class ProjectFormatError(ValueError):
@@ -256,6 +256,8 @@ class ProjectSerializer:
     # -------------------------------------------------------------------------
     # ZAPIS
     # -------------------------------------------------------------------------
+    # Uwaga: nie wołać item.parentItem() na obiektach sceny – w PySide6 przejmuje to obiekt na własność
+    # Pythona i po zniknięciu wrappera usuwa go ze sceny. topLevelItem() jest bezpieczne.
     @staticmethod
     def _helper_items(studio: "LaserBurnStudio") -> set:
         names = ("transform_box", "laser_reticle", "crosshair", "guides", "boundary_item", "centroid_item")
@@ -288,7 +290,7 @@ class ProjectSerializer:
         # Od najniższego Z, aby kolejność rysowania odtworzyła się także przy równych Z
         # Kolejność rysowania Qt (rosnąco): Z, a przy równym Z kolejność dodania – deterministyczna
         for it in studio.scene.items(Qt.SortOrder.AscendingOrder):
-            if it in helpers or it.zValue() < 10 or it.parentItem() is not None:
+            if it in helpers or it.zValue() < 10 or it.topLevelItem() is not it:
                 continue
 
             common = {
@@ -359,7 +361,7 @@ class ProjectSerializer:
             studio._clear_boundary()
         helpers = cls._helper_items(studio)
         for it in list(studio.scene.items()):
-            if it in helpers or it.zValue() < 10 or it.parentItem() is not None:
+            if it in helpers or it.zValue() < 10 or it.topLevelItem() is not it:
                 continue
             studio.scene.removeItem(it)
         studio.scene.clearSelection()
