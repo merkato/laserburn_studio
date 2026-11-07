@@ -11,51 +11,93 @@ Aplikacja została zaprojektowana od podstaw z myślą o precyzyjnym pozycjonowa
 ## 🚀 Kluczowe Możliwości
 
 * **Wektorowy silnik CAD (PySide6):**
-  * Zorientowany pod układ współrzędnych CNC ($Y$ rosnące w górę stołu roboczego).
-  * Wielopunktowy manipulator przekształceń (`TransformBoxItem`) ze skalowaniem proporcjonalnym, obrotem i translacją z przyciąganiem magnetycznym (`SnapEngine`).
-  * Obsługa schowka wewnętrznego (Kopiuj `Ctrl+C`, Wklej `Ctrl+V`, Duplikuj `Ctrl+D`).
-  * Zarządzanie poziomami renderowania (Z-Order: Na wierzch / Na spód / Stopniowanie).
+  * Układ współrzędnych CNC ($Y$ rośnie w górę stołu roboczego).
+  * Manipulator przekształceń (`TransformBoxItem`) ze skalowaniem proporcjonalnym, obrotem i przyciąganiem (`SnapEngine`).
+  * Schowek (Kopiuj `Ctrl+C`, Wklej `Ctrl+V`, Duplikuj `Ctrl+D`) i kolejność rysowania (Z-Order).
+  * **Kształty i symbole** z dokładnymi wymiarami: linia, prostokąt (z zaokrągleniem), elipsa/okrąg, wielokąt foremny, gwiazda, serce (menu *Wstaw*).
 
-* **Import SVG (Inkscape-ready):**
-  * Dokładne odwzorowanie geometrii z przeliczeniem jednostek 96 DPI na milimetry ($25.4 / 96.0$).
-  * Rzutowanie tekstów i glifów czcionek na krzywe Béziera z zachowaniem zakotwiczenia (`text-anchor`).
-  * Rozpoznawanie atrybutów kolorów obrysów oraz stylów inline CSS z automatycznym przypisaniem do warstw technologicznych.
+* **Import SVG (Inkscape, Illustrator i inne):**
+  * Parser `svgelements` z obsługą `viewBox`, jednostek i transformacji; pliki Illustratora zapisane w px rozpoznawane jako 72 DPI.
+  * Obiekty zachowują położenie ze strony dokumentu i kolory (obrys, a przy jego braku wypełnienie); raport kolorów bez warstwy.
 
-* **Dedykowany silnik rastrowy (Floyd-Steinberg Dithering):**
-  * 1-bitowa kwantyzacja rozpraszania błędu dla uzyskania półtonów na drewnie.
-  * Generowanie dwukierunkowej ścieżki skanowania poziomego (boustrophedon).
-  * Dynamiczna kontrola mocy lasera w trybie `M4` z dobiegami i wyhamowaniami (`overscan 2.5 mm`), eliminującymi przypalenia na nawrotach osi.
+* **Warstwy technologiczne i baza materiałów:**
+  * Operacje **Cięcie**, **Linia**, **Fill** (kreskowanie z otworami wg reguły parzystości) i **Raster**.
+  * Tryb dynamicznej mocy `M4`, gaszenie wiązki (`M5`) przed każdym przejazdem jałowym, kolejność ścieżek metodą najbliższego sąsiada.
+  * **Baza materiałów** (JSON w katalogu użytkownika) – jednym kliknięciem ustawia parametry warstw dla wybranego materiału.
+  * **Generator testu materiałowego** – siatka pól moc × prędkość dla cięcia i wypełnienia.
+
+* **Silnik rastrowy:**
+  * Dithering Floyd–Steinberga (NumPy/Pillow), uwzględnienie orientacji EXIF i przezroczystości.
+  * Dwukierunkowe skanowanie `M4` z dobiegiem 2.5 mm na nawrotach.
 
 * **Moduł „Plaster Drewna” (Boundary Mapping & Auto-Fit):**
-  * Rejestracja punktów krawędzi materiału za pomocą plamki celującej lasera (jogging).
-  * Generowanie gładkiej otoczki wielokątnej (Shapely Convex Hull) z wyznaczeniem środka geometrycznego (centroidu).
-  * Funkcja **Auto-Fit**: automatyczne wpisanie, przeskalowanie z marginesem bezpieczeństwa i wycentrowanie grafiki wewnątrz nieregularnego plastra.
+  * Rejestracja krawędzi materiału plamką celującą, otoczka (Shapely) z opcjonalnym wygładzeniem splajnem.
+  * **Auto-Fit**: wpisanie projektu w nieregularny materiał z marginesem, w razie potrzeby zmniejszenie lub najmniejszy konieczny obrót.
 
-* **Dwukierunkowa telemetria GRBL:**
-  * Komunikacja w czasie rzeczywistym przez WebSocket z mostkiem na Raspberry Pi (`ws://malina.local:8000/ws`). Kod dostępny w osobnym repo.
-  * Bezpośredni podgląd współrzędnych roboczych `WPos` i statusu maszyny (Idle, Run, Jog, Hold).
-  * Płynny wskaźnik głowicy lasera (`LaserReticleItem`).
-  * Natychmiastowe zatrzymanie awaryjne E-STOP (Feed Hold `!` + `M5` + Jog Cancel).
+* **Sterowanie maszyną przez [grbl-bridge](https://github.com/merkato/grbl-bridge):**
+  * WebSocket z mostkiem na Raspberry Pi (`ws://malina.local:8000/ws`), telemetria `WPos` i stanu GRBL, wskaźnik głowicy.
+  * Pauza i wznowienie zadania, **STOP** z czyszczeniem bufora (feed hold → soft reset, bez utraty pozycji), wyjście z *Hold* po przycisku bezpieczeństwa.
+
+* **Samodzielny instalator dla Windows** – nie wymaga Pythona ani bibliotek na komputerze docelowym.
+
+---
+
+## 📦 Instalacja
+
+**Windows 10/11 (64-bit):** uruchom `LaserBurnStudio-<wersja>-setup.exe` albo rozpakuj `LaserBurnStudio-<wersja>-portable.zip` i uruchom `LaserBurnStudio.exe`.
+
+**Ze źródeł** (Python 3.10+):
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+python laserburn_studio.py
+```
+
+**Budowanie instalatora:**
+
+```bash
+.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+.venv\Scripts\python.exe build.py
+```
+
+Wynik trafia do `dist\`: katalog programu, archiwum przenośne i – gdy zainstalowano [Inno Setup 6](https://jrsoftware.org/isdl.php) – instalator. Szczegóły w [instrukcji](instrukcja.md#1-instalacja-i-pierwsze-uruchomienie).
 
 ---
 
 ## 🛠️ Architektura i Struktura Projektu
 
-Projekt oparty jest na modułach:
-
 ```text
 laserburn_studio/
-├── laserburn_studio.py     # Główna aplikacja, UI (PySide6), orkiestracja CAD i CAM
-├── svg_engine.py           # Parser SVG (svgelements + XML), mapowanie stylów i fontów
-├── raster_engine.py        # Algorytmy ditheringu PIL/NumPy oraz generator ścieżek M4
-├── gcode_visualizer.py     # Symulator wygenerowanego kodu G-code (estymacja trapezoidalna)
-├── jog_panel.py            # Widżet sterowania osiami (Jogging krokami 0.1-50 mm)
-├── rulers.py               # Dynamiczne linijki stołu roboczego powiązane z zoomem
-├── time_estimator.py       # Estymator czasu pracy z modelem dynamiki ruchu
-├── project_manager.py      # Serializacja i deserializacja projektów (.lcam)
-├── INSTRUKCJA.md           # Szczegółowa instrukcja obsługi krok po kroku
-└── README.md               # Prezentacja projektu i dokumentacja techniczna
+├── laserburn_studio.py     # Główne okno, UI (PySide6), orkiestracja CAD i CAM
+├── app_info.py             # Nazwa, wersja, ścieżki danych i zasobów
+├── shapes.py               # Geometria kształtów i symboli (QPainterPath w mm)
+├── shape_dialog.py         # Okno „Wstaw kształt” z podglądem
+├── svg_engine.py           # Import SVG (svgelements) z raportem
+├── raster_engine.py        # Dithering i generator ścieżek rastrowych M4
+├── cam_engine.py           # Postprocesor G-code (wektory, kreskowanie Fill)
+├── path_optimizer.py       # Kolejność ścieżek (najbliższy sąsiad), wykrywanie konturów zamkniętych
+├── kerf_compensator.py     # Kompensacja rzazu (przygotowana, jeszcze nieużywana w G-code)
+├── material_library.py     # Baza materiałów (JSON) i przypisanie do warstw
+├── materials_dialog.py     # Okno edycji bazy materiałów
+├── material_tester.py      # Generator testu materiałowego
+├── material_fitting.py     # Auto-Fit projektu w obrys materiału
+├── bridge_client.py        # Klient grbl-bridge (WebSocket + HTTP), sterowanie zadaniem
+├── jog_panel.py            # Panel Jog: ruchy osi, pauza/wznowienie/STOP
+├── gcode_visualizer.py     # Symulator G-code
+├── time_estimator.py       # Estymator czasu pracy (model trapezoidalny)
+├── rulers.py               # Linijki stołu roboczego
+├── project_manager.py      # Zapis i odczyt projektów (.lcam, format v2)
+├── smoke_test.py           # Test uruchomienia wersji spakowanej (--smoke-test)
+├── build.py                # Budowanie programu i instalatora (PyInstaller + Inno Setup)
+├── installer/              # Skrypt instalatora Inno Setup
+├── assets/                 # Ikona programu
+├── tools/make_icon.py      # Generator ikony
+├── instrukcja.md           # Instrukcja obsługi krok po kroku
+└── README.md               # Prezentacja projektu
 ```
+
 ---
 
 ## ✒️ Uwagi Autora i Podziękowania
